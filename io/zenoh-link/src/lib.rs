@@ -25,7 +25,9 @@ use zenoh_result::{bail, ZResult};
 #[cfg(feature = "transport_tcp")]
 pub use zenoh_link_tcp as tcp;
 #[cfg(feature = "transport_tcp")]
-use zenoh_link_tcp::{LinkManagerUnicastTcp, TcpLocatorInspector, TCP_LOCATOR_PREFIX};
+use zenoh_link_tcp::{
+    LinkManagerUnicastTcp, TcpConfigurator, TcpLocatorInspector, TCP_LOCATOR_PREFIX,
+};
 
 #[cfg(feature = "transport_udp")]
 pub use zenoh_link_udp as udp;
@@ -144,6 +146,8 @@ impl LocatorInspector {
 }
 #[derive(Default)]
 pub struct LinkConfigurator {
+    #[cfg(feature = "transport_tcp")]
+    tcp_inspector: TcpConfigurator,
     #[cfg(feature = "transport_quic")]
     quic_inspector: QuicConfigurator,
     #[cfg(feature = "transport_tls")]
@@ -171,6 +175,13 @@ impl LinkConfigurator {
                 errors.insert(proto, e);
             }
         };
+        #[cfg(feature = "transport_tcp")]
+        {
+            insert_config(
+                TCP_LOCATOR_PREFIX.into(),
+                self.tcp_inspector.inspect_config(config).await,
+            );
+        }
         #[cfg(feature = "transport_quic")]
         {
             insert_config(

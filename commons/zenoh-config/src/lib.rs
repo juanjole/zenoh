@@ -309,6 +309,12 @@ validated_struct::validator! {
                     /// Fragmented messages that are larger than the configured size will be dropped.
                     max_message_size: usize,
                 },
+                pub tcp: #[derive(Default)]
+                TcpConf {
+                    /// Configure the SO_LINGER option for TCP sockets. Expressed in seconds.
+                    /// A negative value disables SO_LINGER. If not set, defaults to 10 seconds.
+                    so_linger: Option<i32>,
+                },
                 pub tls: #[derive(Default)]
                 TLSConf {
                     root_ca_certificate: Option<String>,
@@ -318,6 +324,9 @@ validated_struct::validator! {
                     client_private_key: Option<String>,
                     client_certificate: Option<String>,
                     server_name_verification: Option<bool>,
+                    /// Configure the SO_LINGER option for TLS sockets. Expressed in seconds.
+                    /// A negative value disables SO_LINGER. If not set, defaults to 10 seconds.
+                    so_linger: Option<i32>,
                     // Skip serializing field because they contain secrets
                     #[serde(skip_serializing)]
                     root_ca_certificate_base64: Option<SecretValue>,
