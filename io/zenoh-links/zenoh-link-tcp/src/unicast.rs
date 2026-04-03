@@ -32,7 +32,7 @@ use zenoh_result::{bail, zerror, Error as ZError, ZResult};
 use zenoh_sync::Signal;
 
 use super::{
-    get_tcp_addrs, TCP_ACCEPT_THROTTLE_TIME, TCP_DEFAULT_MTU, TCP_LINGER_TIMEOUT,
+    get_tcp_addrs, TCP_ACCEPT_THROTTLE_TIME, TCP_DEFAULT_MTU, TCP_LINGER_TIMEOUT, TCP_SO_LINGER,
     TCP_LOCATOR_PREFIX,
 };
 
@@ -48,7 +48,12 @@ pub struct LinkUnicastTcp {
 }
 
 impl LinkUnicastTcp {
-    fn new(socket: TcpStream, src_addr: SocketAddr, dst_addr: SocketAddr) -> LinkUnicastTcp {
+    fn new(
+        socket: TcpStream,
+        src_addr: SocketAddr,
+        dst_addr: SocketAddr,
+        linger: Option<Duration>,
+    ) -> LinkUnicastTcp {
         // Set the TCP nodelay option
         if let Err(err) = socket.set_nodelay(true) {
             log::warn!(
@@ -60,12 +65,7 @@ impl LinkUnicastTcp {
         }
 
         // Set the TCP linger option
-        if let Err(err) = zenoh_util::net::set_linger(
-            &socket,
-            Some(Duration::from_secs(
-                (*TCP_LINGER_TIMEOUT).try_into().unwrap(),
-            )),
-        ) {
+        if let Err(err) = zenoh_util::net::set_linger(&socket, linger) {
             log::warn!(
                 "Unable to set LINGER option on TCP link {} => {}: {}",
                 src_addr,
@@ -256,12 +256,13 @@ impl LinkManagerUnicastTcp {
 impl LinkManagerUnicastTrait for LinkManagerUnicastTcp {
     async fn new_link(&self, endpoint: EndPoint) -> ZResult<LinkUnicast> {
         let dst_addrs = get_tcp_addrs(endpoint.address()).await?;
+        let linger = get_so_linger(endpoint.config());
 
         let mut errs: Vec<ZError> = vec![];
         for da in dst_addrs {
             match self.new_link_inner(&da).await {
                 Ok((stream, src_addr, dst_addr)) => {
-                    let link = Arc::new(LinkUnicastTcp::new(stream, src_addr, dst_addr));
+                    let link = Arc::new(LinkUnicastTcp::new(stream, src_addr, dst_addr, linger));
                     return Ok(LinkUnicast(link));
                 }
                 Err(e) => {
@@ -283,6 +284,7 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastTcp {
 
     async fn new_listener(&self, mut endpoint: EndPoint) -> ZResult<Locator> {
         let addrs = get_tcp_addrs(endpoint.address()).await?;
+        let linger = get_so_linger(endpoint.config());
 
         let mut errs: Vec<ZError> = vec![];
         for da in addrs {
@@ -308,7 +310,8 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastTcp {
                     let c_addr = local_addr;
                     let handle = task::spawn(async move {
                         // Wait for the accept loop to terminate
-                        let res = accept_task(socket, c_active, c_signal, c_manager).await;
+                        let res =
+                            accept_task(socket, c_active, c_signal, c_manager, linger).await;
                         zwrite!(c_listeners).remove(&c_addr);
                         res
                     });
@@ -412,11 +415,30 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastTcp {
     }
 }
 
+fn get_so_linger(config: zenoh_protocol::core::endpoint::Config<'_>) -> Option<Duration> {
+    match config.get(TCP_SO_LINGER) {
+        Some(s) => match s.parse::<i32>() {
+            Ok(v) if v >= 0 => Some(Duration::from_secs(v as u64)),
+            Ok(_) => None,
+            Err(_) => {
+                log::warn!("Invalid TCP so_linger value: {}. Using default.", s);
+                Some(Duration::from_secs(
+                    (*TCP_LINGER_TIMEOUT).try_into().unwrap(),
+                ))
+            }
+        },
+        None => Some(Duration::from_secs(
+            (*TCP_LINGER_TIMEOUT).try_into().unwrap(),
+        )),
+    }
+}
+
 async fn accept_task(
     socket: TcpListener,
     active: Arc<AtomicBool>,
     signal: Signal,
     manager: NewLinkChannelSender,
+    linger: Option<Duration>,
 ) -> ZResult<()> {
     enum Action {
         Accept((TcpStream, SocketAddr)),
@@ -462,7 +484,7 @@ async fn accept_task(
 
         log::debug!("Accepted TCP connection on {:?}: {:?}", src_addr, dst_addr);
         // Create the new link object
-        let link = Arc::new(LinkUnicastTcp::new(stream, src_addr, dst_addr));
+        let link = Arc::new(LinkUnicastTcp::new(stream, src_addr, dst_addr, linger));
 
         // Communicate the new link to the initial transport manager
         if let Err(e) = manager.send_async(LinkUnicast(link)).await {

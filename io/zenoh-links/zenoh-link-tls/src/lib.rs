@@ -25,6 +25,7 @@ use config::{
     TLS_CLIENT_PRIVATE_KEY_BASE64, TLS_CLIENT_PRIVATE_KEY_FILE, TLS_ROOT_CA_CERTIFICATE_BASE64,
     TLS_ROOT_CA_CERTIFICATE_FILE, TLS_SERVER_CERTIFICATE_BASE64, TLS_SERVER_CERTIFICATE_FILE,
     TLS_SERVER_NAME_VERIFICATION, TLS_SERVER_PRIVATE_KEY_BASE_64, TLS_SERVER_PRIVATE_KEY_FILE,
+    TLS_SO_LINGER,
 };
 use secrecy::ExposeSecret;
 use std::{convert::TryFrom, net::SocketAddr};
@@ -166,6 +167,12 @@ impl ConfigurationInspector<Config> for TlsConfigurator {
             };
         }
 
+        let linger_str;
+        if let Some(linger) = c.so_linger() {
+            linger_str = linger.to_string();
+            ps.push((TLS_SO_LINGER, &linger_str));
+        }
+
         let mut s = String::new();
         endpoint::Parameters::extend(ps.drain(..), &mut s);
 
@@ -210,6 +217,8 @@ pub mod config {
     pub const TLS_CLIENT_AUTH: &str = "client_auth";
 
     pub const TLS_SERVER_NAME_VERIFICATION: &str = "server_name_verification";
+
+    pub const TLS_SO_LINGER: &str = "so_linger";
 }
 
 pub async fn get_tls_addr(address: &Address<'_>) -> ZResult<SocketAddr> {

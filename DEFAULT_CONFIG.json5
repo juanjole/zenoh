@@ -241,6 +241,15 @@
         // This could be dangerous because your CA can have signed a server cert for foo.com, that's later being used to host a server at baz.com. If you wan't your
         // ca to verify that the server at baz.com is actually baz.com, let this be true (default).
         server_name_verification: null,
+        /// Configure the SO_LINGER option for TLS sockets. Expressed in seconds.
+        /// A negative value disables SO_LINGER. Default is 10 seconds.
+        // so_linger: 10,
+      },
+      /// Configure TCP specific parameters
+      tcp: {
+        /// Configure the SO_LINGER option for TCP sockets. Expressed in seconds.
+        /// A negative value disables SO_LINGER. Default is 10 seconds.
+        // so_linger: 10,
       },
     },
     /// Shared memory configuration

@@ -20,13 +20,17 @@
 use async_std::net::ToSocketAddrs;
 use async_trait::async_trait;
 use std::net::SocketAddr;
+use zenoh_config::Config;
 use zenoh_core::zconfigurable;
-use zenoh_link_commons::LocatorInspector;
-use zenoh_protocol::core::{endpoint::Address, Locator};
+use zenoh_link_commons::{ConfigurationInspector, LocatorInspector};
+use zenoh_protocol::core::{endpoint::Address, endpoint::Parameters, Locator};
 use zenoh_result::{zerror, ZResult};
 
 mod unicast;
 pub use unicast::*;
+
+/// The key for the SO_LINGER socket option in endpoint configuration.
+pub const TCP_SO_LINGER: &str = "so_linger";
 
 // Default MTU (TCP PDU) in bytes.
 // NOTE: Since TCP is a byte-stream oriented transport, theoretically it has
@@ -48,6 +52,29 @@ impl LocatorInspector for TcpLocatorInspector {
 
     async fn is_multicast(&self, _locator: &Locator) -> ZResult<bool> {
         Ok(false)
+    }
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+pub struct TcpConfigurator;
+
+#[async_trait]
+impl ConfigurationInspector<Config> for TcpConfigurator {
+    async fn inspect_config(&self, config: &Config) -> ZResult<String> {
+        let mut ps: Vec<(&str, &str)> = vec![];
+
+        let c = config.transport().link().tcp();
+
+        let linger_str;
+        if let Some(linger) = c.so_linger() {
+            linger_str = linger.to_string();
+            ps.push((TCP_SO_LINGER, &linger_str));
+        }
+
+        let mut s = String::new();
+        Parameters::extend(ps.drain(..), &mut s);
+
+        Ok(s)
     }
 }
 

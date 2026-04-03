@@ -84,6 +84,7 @@ impl LinkUnicastTls {
         socket: TlsStream<TcpStream>,
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
+        linger: Option<Duration>,
     ) -> LinkUnicastTls {
         let (tcp_stream, _) = socket.get_ref();
         // Set the TLS nodelay option
@@ -97,12 +98,7 @@ impl LinkUnicastTls {
         }
 
         // Set the TLS linger option
-        if let Err(err) = zenoh_util::net::set_linger(
-            tcp_stream,
-            Some(Duration::from_secs(
-                (*TLS_LINGER_TIMEOUT).try_into().unwrap(),
-            )),
-        ) {
+        if let Err(err) = zenoh_util::net::set_linger(tcp_stream, linger) {
             log::warn!(
                 "Unable to set LINGER option on TLS link {} => {}: {}",
                 src_addr,
@@ -324,7 +320,8 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastTls {
             })?;
         let tls_stream = TlsStream::Client(tls_stream);
 
-        let link = Arc::new(LinkUnicastTls::new(tls_stream, src_addr, dst_addr));
+        let linger = get_so_linger(&epconf);
+        let link = Arc::new(LinkUnicastTls::new(tls_stream, src_addr, dst_addr, linger));
 
         Ok(LinkUnicast(link))
     }
@@ -332,6 +329,7 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastTls {
     async fn new_listener(&self, endpoint: EndPoint) -> ZResult<Locator> {
         let epaddr = endpoint.address();
         let epconf = endpoint.config();
+        let linger = get_so_linger(&epconf);
 
         let addr = get_tls_addr(&epaddr).await?;
         let host = get_tls_host(&epaddr)?;
@@ -364,7 +362,8 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastTls {
         let c_addr = local_addr;
         let handle = task::spawn(async move {
             // Wait for the accept loop to terminate
-            let res = accept_task(socket, acceptor, c_active, c_signal, c_manager).await;
+            let res =
+                accept_task(socket, acceptor, c_active, c_signal, c_manager, linger).await;
             zwrite!(c_listeners).remove(&c_addr);
             res
         });
@@ -442,12 +441,31 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastTls {
     }
 }
 
+fn get_so_linger(config: &Config<'_>) -> Option<Duration> {
+    match config.get(TLS_SO_LINGER) {
+        Some(s) => match s.parse::<i32>() {
+            Ok(v) if v >= 0 => Some(Duration::from_secs(v as u64)),
+            Ok(_) => None,
+            Err(_) => {
+                log::warn!("Invalid TLS so_linger value: {}. Using default.", s);
+                Some(Duration::from_secs(
+                    (*TLS_LINGER_TIMEOUT).try_into().unwrap(),
+                ))
+            }
+        },
+        None => Some(Duration::from_secs(
+            (*TLS_LINGER_TIMEOUT).try_into().unwrap(),
+        )),
+    }
+}
+
 async fn accept_task(
     socket: TcpListener,
     acceptor: TlsAcceptor,
     active: Arc<AtomicBool>,
     signal: Signal,
     manager: NewLinkChannelSender,
+    linger: Option<Duration>,
 ) -> ZResult<()> {
     enum Action {
         Accept((TcpStream, SocketAddr)),
@@ -502,7 +520,7 @@ async fn accept_task(
 
         log::debug!("Accepted TLS connection on {:?}: {:?}", src_addr, dst_addr);
         // Create the new link object
-        let link = Arc::new(LinkUnicastTls::new(tls_stream, src_addr, dst_addr));
+        let link = Arc::new(LinkUnicastTls::new(tls_stream, src_addr, dst_addr, linger));
 
         // Communicate the new link to the initial transport manager
         if let Err(e) = manager.send_async(LinkUnicast(link)).await {
