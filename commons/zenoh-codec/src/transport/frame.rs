@@ -11,8 +11,8 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::{common::extension, RCodec, WCodec, Zenoh080, Zenoh080Header, Zenoh080Reliability};
 use alloc::vec::Vec;
+
 use zenoh_buffers::{
     reader::{BacktrackableReader, DidntRead, Reader},
     writer::{DidntWrite, Writer},
@@ -26,6 +26,8 @@ use zenoh_protocol::{
         id, TransportSn,
     },
 };
+
+use crate::{common::extension, RCodec, WCodec, Zenoh080, Zenoh080Header, Zenoh080Reliability};
 
 // FrameHeader
 impl<W> WCodec<&FrameHeader, &mut W> for Zenoh080
@@ -46,7 +48,7 @@ where
         if let Reliability::Reliable = reliability {
             header |= flag::R;
         }
-        if ext_qos != &ext::QoSType::default() {
+        if ext_qos != &ext::QoSType::DEFAULT {
             header |= flag::Z;
         }
         self.write(&mut *writer, header)?;
@@ -55,7 +57,7 @@ where
         self.write(&mut *writer, sn)?;
 
         // Extensions
-        if ext_qos != &ext::QoSType::default() {
+        if ext_qos != &ext::QoSType::DEFAULT {
             self.write(&mut *writer, (x.ext_qos, false))?;
         }
 
@@ -94,7 +96,7 @@ where
         let sn: TransportSn = self.codec.read(&mut *reader)?;
 
         // Extensions
-        let mut ext_qos = ext::QoSType::default();
+        let mut ext_qos = ext::QoSType::DEFAULT;
 
         let mut has_ext = imsg::has_flag(self.header, flag::Z);
         while has_ext {
@@ -194,5 +196,51 @@ where
             ext_qos: header.ext_qos,
             payload,
         })
+    }
+}
+
+#[derive(Debug)]
+pub struct FrameReader<'a, R: BacktrackableReader> {
+    pub reliability: Reliability,
+    pub sn: TransportSn,
+    pub ext_qos: ext::QoSType,
+    reader: &'a mut R,
+}
+
+impl<'a, R: BacktrackableReader> RCodec<FrameReader<'a, R>, &'a mut R> for Zenoh080 {
+    type Error = DidntRead;
+
+    fn read(self, reader: &'a mut R) -> Result<FrameReader<'a, R>, Self::Error> {
+        let mark = reader.mark();
+        let Ok(header): Result<FrameHeader, _> = self.read(&mut *reader) else {
+            reader.rewind(mark);
+            return Err(DidntRead);
+        };
+        Ok(FrameReader {
+            reliability: header.reliability,
+            sn: header.sn,
+            ext_qos: header.ext_qos,
+            reader,
+        })
+    }
+}
+
+impl<R: BacktrackableReader> Iterator for FrameReader<'_, R> {
+    type Item = NetworkMessage;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        let mark = self.reader.mark();
+        let msg = Zenoh080Reliability::new(self.reliability).read(self.reader);
+        if msg.is_err() {
+            self.reader.rewind(mark);
+        }
+        msg.ok()
+    }
+}
+
+impl<R: BacktrackableReader> Drop for FrameReader<'_, R> {
+    fn drop(&mut self) {
+        for _ in self {}
     }
 }

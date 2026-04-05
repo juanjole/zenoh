@@ -11,68 +11,67 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use async_std::sync::RwLock;
-use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::Arc;
-use zenoh::prelude::r#async::*;
-use zenoh::time::Timestamp;
-use zenoh_backend_traits::config::{StorageConfig, VolumeConfig};
-use zenoh_backend_traits::*;
-use zenoh_result::ZResult;
+use std::{collections::HashMap, sync::Arc};
 
-pub fn create_memory_backend(config: VolumeConfig) -> ZResult<Box<dyn Volume>> {
-    Ok(Box::new(MemoryBackend { config }))
-}
+use async_trait::async_trait;
+use tokio::sync::RwLock;
+use zenoh::{
+    bytes::{Encoding, ZBytes},
+    key_expr::OwnedKeyExpr,
+    time::Timestamp,
+    Result as ZResult,
+};
+use zenoh_backend_traits::{
+    config::{StorageConfig, VolumeConfig},
+    *,
+};
+use zenoh_plugin_trait::{plugin_long_version, plugin_version, Plugin};
+use zenoh_util::ffi::JsonValue;
+
+use crate::MEMORY_BACKEND_NAME;
 
 pub struct MemoryBackend {
     config: VolumeConfig,
 }
 
+impl Plugin for MemoryBackend {
+    type StartArgs = VolumeConfig;
+    type Instance = VolumeInstance;
+
+    const DEFAULT_NAME: &'static str = MEMORY_BACKEND_NAME;
+    const PLUGIN_VERSION: &'static str = plugin_version!();
+    const PLUGIN_LONG_VERSION: &'static str = plugin_long_version!();
+
+    fn start(_: &str, args: &VolumeConfig) -> ZResult<VolumeInstance> {
+        Ok(Box::new(MemoryBackend {
+            config: args.clone(),
+        }))
+    }
+}
+
 #[async_trait]
 impl Volume for MemoryBackend {
-    fn get_admin_status(&self) -> serde_json::Value {
-        self.config.to_json_value()
+    fn get_admin_status(&self) -> JsonValue {
+        self.config.to_json_value().into()
     }
 
     fn get_capability(&self) -> Capability {
         Capability {
             persistence: Persistence::Volatile,
             history: History::Latest,
-            read_cost: 0,
         }
     }
 
-    async fn create_storage(&mut self, properties: StorageConfig) -> ZResult<Box<dyn Storage>> {
-        log::debug!("Create Memory Storage with configuration: {:?}", properties);
+    async fn create_storage(&self, properties: StorageConfig) -> ZResult<Box<dyn Storage>> {
+        tracing::debug!("Create Memory Storage with configuration: {:?}", properties);
         Ok(Box::new(MemoryStorage::new(properties).await?))
-    }
-
-    fn incoming_data_interceptor(&self) -> Option<Arc<dyn Fn(Sample) -> Sample + Send + Sync>> {
-        // By default: no interception point
-        None
-        // To test interceptors, uncomment this line:
-        // Some(Arc::new(|sample| {
-        //     trace!(">>>> IN INTERCEPTOR FOR {:?}", sample);
-        //     sample
-        // }))
-    }
-
-    fn outgoing_data_interceptor(&self) -> Option<Arc<dyn Fn(Sample) -> Sample + Send + Sync>> {
-        // By default: no interception point
-        None
-        // To test interceptors, uncomment this line:
-        // Some(Arc::new(|sample| {
-        //     trace!("<<<< OUT INTERCEPTOR FOR {:?}", sample);
-        //     sample
-        // }))
     }
 }
 
 impl Drop for MemoryBackend {
     fn drop(&mut self) {
         // nothing to do in case of memory backend
-        log::trace!("MemoryBackend::drop()");
+        tracing::trace!("MemoryBackend::drop()");
     }
 }
 
@@ -92,25 +91,34 @@ impl MemoryStorage {
 
 #[async_trait]
 impl Storage for MemoryStorage {
-    fn get_admin_status(&self) -> serde_json::Value {
-        self.config.to_json_value()
+    fn get_admin_status(&self) -> JsonValue {
+        self.config.to_json_value().into()
     }
 
     async fn put(
         &mut self,
         key: Option<OwnedKeyExpr>,
-        value: Value,
+        payload: ZBytes,
+        encoding: Encoding,
         timestamp: Timestamp,
     ) -> ZResult<StorageInsertionResult> {
-        log::trace!("put for {:?}", key);
+        tracing::trace!("put for {:?}", key);
         let mut map = self.map.write().await;
         match map.entry(key) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
-                e.insert(StoredData { value, timestamp });
+                e.insert(StoredData {
+                    payload,
+                    encoding,
+                    timestamp,
+                });
                 return Ok(StorageInsertionResult::Replaced);
             }
             std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(StoredData { value, timestamp });
+                e.insert(StoredData {
+                    payload,
+                    encoding,
+                    timestamp,
+                });
                 return Ok(StorageInsertionResult::Inserted);
             }
         }
@@ -121,7 +129,7 @@ impl Storage for MemoryStorage {
         key: Option<OwnedKeyExpr>,
         _timestamp: Timestamp,
     ) -> ZResult<StorageInsertionResult> {
-        log::trace!("delete for {:?}", key);
+        tracing::trace!("delete for {:?}", key);
         self.map.write().await.remove_entry(&key);
         return Ok(StorageInsertionResult::Deleted);
     }
@@ -131,11 +139,11 @@ impl Storage for MemoryStorage {
         key: Option<OwnedKeyExpr>,
         _parameters: &str,
     ) -> ZResult<Vec<StoredData>> {
-        log::trace!("get for {:?}", key);
+        tracing::trace!("get for {:?}", key);
         // @TODO: use parameters???
         match self.map.read().await.get(&key) {
             Some(v) => Ok(vec![v.clone()]),
-            None => Err(format!("Key {:?} is not present", key).into()),
+            None => Err(format!("Key {key:?} is not present").into()),
         }
     }
 
@@ -152,6 +160,6 @@ impl Storage for MemoryStorage {
 impl Drop for MemoryStorage {
     fn drop(&mut self) {
         // nothing to do in case of memory backend
-        log::trace!("MemoryStorage::drop()");
+        tracing::trace!("MemoryStorage::drop()");
     }
 }

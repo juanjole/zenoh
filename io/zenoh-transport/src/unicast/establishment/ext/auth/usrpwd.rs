@@ -11,11 +11,11 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::unicast::establishment::{ext::auth::id, AcceptFsm, OpenFsm};
-use async_std::{fs, sync::RwLock};
+use std::{collections::HashMap, fmt};
+
 use async_trait::async_trait;
 use rand::{CryptoRng, Rng};
-use std::{collections::HashMap, fmt};
+use tokio::sync::RwLock;
 use zenoh_buffers::{
     reader::{DidntRead, HasReader, Reader},
     writer::{DidntWrite, HasWriter, Writer},
@@ -26,9 +26,12 @@ use zenoh_core::{bail, zasyncread, zerror, Error as ZError, Result as ZResult};
 use zenoh_crypto::hmac;
 use zenoh_protocol::common::{ZExtUnit, ZExtZ64, ZExtZBuf};
 
+use crate::unicast::establishment::{ext::auth::id, AcceptFsm, OpenFsm};
+
 mod ext {
-    use super::{id::USRPWD, ZExtUnit, ZExtZ64, ZExtZBuf};
     use zenoh_protocol::{zextunit, zextz64, zextzbuf};
+
+    use super::id::USRPWD;
 
     pub(super) type InitSyn = zextunit!(USRPWD, false);
     pub(super) type InitAck = zextz64!(USRPWD, false);
@@ -68,7 +71,7 @@ impl AuthUsrPwd {
 
         let mut lookup: HashMap<User, Password> = HashMap::new();
         if let Some(dict) = config.dictionary_file() {
-            let content = fs::read_to_string(dict)
+            let content = tokio::fs::read_to_string(dict)
                 .await
                 .map_err(|e| zerror!("{S} Invalid user-password dictionary file: {}.", e))?;
 
@@ -79,32 +82,36 @@ impl AuthUsrPwd {
             //      usr3:pwd3
             // I.e.: one <user>:<password> entry per line
             for l in content.lines() {
-                let idx = l.find(':').ok_or_else(|| {
+                let line = l.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let idx = line.find(':').ok_or_else(|| {
                     zerror!("{S} Invalid user-password dictionary file: invalid format.")
                 })?;
-                let user = l[..idx].as_bytes().to_owned();
+                let user = line[..idx].trim().as_bytes().to_owned();
                 if user.is_empty() {
                     bail!("{S} Invalid user-password dictionary file: empty user.")
                 }
-                let password = l[idx + 1..].as_bytes().to_owned();
+                let password = line[idx + 1..].trim().as_bytes().to_owned();
                 if password.is_empty() {
                     bail!("{S} Invalid user-password dictionary file: empty password.")
                 }
                 lookup.insert(user, password);
             }
-            log::debug!("{S} User-password dictionary has been configured.");
+            tracing::debug!("{S} User-password dictionary has been configured.");
         }
 
         let mut credentials: Option<(User, Password)> = None;
         if let Some(user) = config.user() {
             if let Some(password) = config.password() {
-                log::debug!("{S} User-password has been configured.");
+                tracing::debug!("{S} User-password has been configured.");
                 credentials = Some((user.as_bytes().to_owned(), password.as_bytes().to_owned()));
             }
         }
 
         if !lookup.is_empty() || credentials.is_some() {
-            log::debug!("{S} User-password authentication is enabled.");
+            tracing::debug!("{S} User-password authentication is enabled.");
             Ok(Some(Self {
                 lookup,
                 credentials,
@@ -155,6 +162,8 @@ impl StateOpen {
 pub(crate) struct StateAccept {
     nonce: u64,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UsrPwdId(pub Option<Vec<u8>>);
 
 impl StateAccept {
     pub(crate) fn new<R>(prng: &mut R) -> Self
@@ -206,27 +215,9 @@ impl<'a> AuthUsrPwdFsm<'a> {
 }
 
 /*************************************/
-/*             InitSyn               */
-/*************************************/
-///  7 6 5 4 3 2 1 0
-/// +-+-+-+-+-+-+-+-+
-/// +---------------+
-///
-/// ZExtUnit
-
-/*************************************/
-/*             InitAck               */
-/*************************************/
-///  7 6 5 4 3 2 1 0
-/// +-+-+-+-+-+-+-+-+
-/// ~     nonce     ~
-/// +---------------+
-///
-/// ZExtZ64
-
-/*************************************/
 /*             OpenSyn               */
 /*************************************/
+/// ```text
 ///  7 6 5 4 3 2 1 0
 /// +-+-+-+-+-+-+-+-+
 /// ~     user      ~
@@ -235,6 +226,7 @@ impl<'a> AuthUsrPwdFsm<'a> {
 /// +---------------+
 ///
 /// ZExtZBuf
+/// ```
 struct OpenSyn {
     user: Vec<u8>,
     hmac: Vec<u8>,
@@ -269,11 +261,13 @@ where
 /*************************************/
 /*             OpenAck               */
 /*************************************/
+/// ```text
 ///  7 6 5 4 3 2 1 0
 /// +-+-+-+-+-+-+-+-+
 /// +---------------+
 ///
 /// ZExtUnit
+/// ```
 
 #[async_trait]
 impl<'a> OpenFsm for &'a AuthUsrPwdFsm<'a> {
@@ -399,7 +393,7 @@ impl<'a> AcceptFsm for &'a AuthUsrPwdFsm<'a> {
     }
 
     type RecvOpenSynIn = (&'a mut StateAccept, Option<ext::OpenSyn>);
-    type RecvOpenSynOut = ();
+    type RecvOpenSynOut = Vec<u8>; //value of userid is returned if recvopensynout is processed as valid
     async fn recv_open_syn(
         self,
         input: Self::RecvOpenSynIn,
@@ -429,8 +423,8 @@ impl<'a> AcceptFsm for &'a AuthUsrPwdFsm<'a> {
         if hmac != open_syn.hmac {
             bail!("{S} Invalid password.");
         }
-
-        Ok(())
+        let username = open_syn.user.to_owned();
+        Ok(username)
     }
 
     type SendOpenAckIn = &'a StateAccept;
@@ -444,14 +438,14 @@ impl<'a> AcceptFsm for &'a AuthUsrPwdFsm<'a> {
 }
 
 mod tests {
-    #[test]
-    fn authenticator_usrpwd_config() {
-        use zenoh_core::zasync_executor_init;
-
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn authenticator_usrpwd_config() {
         async fn inner() {
-            use super::AuthUsrPwd;
             use std::{fs::File, io::Write};
+
             use zenoh_config::UsrPwdConf;
+
+            use super::AuthUsrPwd;
 
             /* [CONFIG] */
             let f1 = "zenoh-test-auth-usrpwd.txt";
@@ -500,9 +494,6 @@ mod tests {
             let _ = std::fs::remove_file(f1);
         }
 
-        async_std::task::block_on(async {
-            zasync_executor_init!();
-            inner().await;
-        });
+        inner().await;
     }
 }

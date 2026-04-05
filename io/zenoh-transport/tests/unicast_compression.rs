@@ -13,28 +13,24 @@
 //
 #[cfg(feature = "transport_compression")]
 mod tests {
-    use async_std::{prelude::FutureExt, task};
-    use std::fmt::Write as _;
     use std::{
         any::Any,
         convert::TryFrom,
+        fmt::Write as _,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
         },
         time::Duration,
     };
-    use zenoh_core::zasync_executor_init;
+
+    use zenoh_core::ztimeout;
     use zenoh_link::Link;
     use zenoh_protocol::{
         core::{
-            Channel, CongestionControl, Encoding, EndPoint, Priority, Reliability, WhatAmI, ZenohId,
+            Channel, CongestionControl, EndPoint, Priority, Reliability, WhatAmI, ZenohIdProto,
         },
-        network::{
-            push::ext::{NodeIdType, QoSType},
-            NetworkMessage, Push,
-        },
-        zenoh::Put,
+        network::{push::ext::QoSType, NetworkMessage, NetworkMessageMut, Push},
     };
     use zenoh_result::ZResult;
     use zenoh_transport::{
@@ -50,14 +46,8 @@ mod tests {
 
     const MSG_COUNT: usize = 1_000;
     const MSG_SIZE_ALL: [usize; 2] = [1_024, 131_072];
-    const MSG_SIZE_LOWLATENCY: [usize; 2] = [1_024, 65000];
     const MSG_SIZE_NOFRAG: [usize; 1] = [1_024];
-
-    macro_rules! ztimeout {
-        ($f:expr) => {
-            $f.timeout(TIMEOUT).await.unwrap()
-        };
-    }
+    const MSG_SIZE_LOWLATENCY: [usize; 1] = MSG_SIZE_NOFRAG;
 
     // Transport Handler for the router
     struct SHRouter {
@@ -108,14 +98,13 @@ mod tests {
     }
 
     impl TransportPeerEventHandler for SCRouter {
-        fn handle_message(&self, _message: NetworkMessage) -> ZResult<()> {
+        fn handle_message(&self, _message: NetworkMessageMut) -> ZResult<()> {
             self.count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
         fn new_link(&self, _link: Link) {}
         fn del_link(&self, _link: Link) {}
-        fn closing(&self) {}
         fn closed(&self) {}
 
         fn as_any(&self) -> &dyn Any {
@@ -149,13 +138,12 @@ mod tests {
     pub struct SCClient;
 
     impl TransportPeerEventHandler for SCClient {
-        fn handle_message(&self, _message: NetworkMessage) -> ZResult<()> {
+        fn handle_message(&self, _message: NetworkMessageMut) -> ZResult<()> {
             Ok(())
         }
 
         fn new_link(&self, _link: Link) {}
         fn del_link(&self, _link: Link) {}
-        fn closing(&self) {}
         fn closed(&self) {}
 
         fn as_any(&self) -> &dyn Any {
@@ -174,28 +162,27 @@ mod tests {
         TransportUnicast,
     ) {
         // Define client and router IDs
-        let client_id = ZenohId::try_from([1]).unwrap();
-        let router_id = ZenohId::try_from([2]).unwrap();
+        let client_id = ZenohIdProto::try_from([1]).unwrap();
+        let router_id = ZenohIdProto::try_from([2]).unwrap();
 
         // Create the router transport manager
         let router_handler = Arc::new(SHRouter::default());
         let unicast = make_transport_manager_builder(
             #[cfg(feature = "transport_multilink")]
             server_endpoints.len(),
-            #[cfg(feature = "shared-memory")]
-            false,
             lowlatency_transport,
-        );
+        )
+        .compression(true);
         let router_manager = TransportManager::builder()
             .zid(router_id)
             .whatami(WhatAmI::Router)
             .unicast(unicast)
-            .build(router_handler.clone())
+            .build_test(router_handler.clone())
             .unwrap();
 
         // Create the listener on the router
         for e in server_endpoints.iter() {
-            println!("Add endpoint: {}", e);
+            println!("Add endpoint: {e}");
             let _ = ztimeout!(router_manager.add_listener(e.clone())).unwrap();
         }
 
@@ -203,8 +190,6 @@ mod tests {
         let unicast = make_transport_manager_builder(
             #[cfg(feature = "transport_multilink")]
             client_endpoints.len(),
-            #[cfg(feature = "shared-memory")]
-            false,
             lowlatency_transport,
         )
         .compression(true);
@@ -212,20 +197,17 @@ mod tests {
             .whatami(WhatAmI::Client)
             .zid(client_id)
             .unicast(unicast)
-            .build(Arc::new(SHClient))
+            .build_test(Arc::new(SHClient))
             .unwrap();
 
         // Create an empty transport with the client
         // Open transport -> This should be accepted
         for e in client_endpoints.iter() {
-            println!("Opening transport with {}", e);
+            println!("Opening transport with {e}");
             let _ = ztimeout!(client_manager.open_transport_unicast(e.clone())).unwrap();
         }
 
-        let client_transport = client_manager
-            .get_transport_unicast(&router_id)
-            .await
-            .unwrap();
+        let client_transport = ztimeout!(client_manager.get_transport_unicast(&router_id)).unwrap();
 
         // Return the handlers
         (
@@ -247,35 +229,35 @@ mod tests {
         for e in endpoints.iter() {
             let _ = write!(ee, "{e} ");
         }
-        println!("Closing transport with {}", ee);
+        println!("Closing transport with {ee}");
         ztimeout!(client_transport.close()).unwrap();
 
         ztimeout!(async {
             while !router_manager.get_transports_unicast().await.is_empty() {
-                task::sleep(SLEEP).await;
+                tokio::time::sleep(SLEEP).await;
             }
         });
 
         // Stop the locators on the manager
         for e in endpoints.iter() {
-            println!("Del locator: {}", e);
+            println!("Del locator: {e}");
             ztimeout!(router_manager.del_listener(e)).unwrap();
         }
 
         ztimeout!(async {
-            while !router_manager.get_listeners().is_empty() {
-                task::sleep(SLEEP).await;
+            while !router_manager.get_listeners().await.is_empty() {
+                tokio::time::sleep(SLEEP).await;
             }
         });
 
         // Wait a little bit
-        task::sleep(SLEEP).await;
+        tokio::time::sleep(SLEEP).await;
 
         ztimeout!(router_manager.close());
         ztimeout!(client_manager.close());
 
         // Wait a little bit
-        task::sleep(SLEEP).await;
+        tokio::time::sleep(SLEEP).await;
     }
 
     async fn test_transport(
@@ -284,56 +266,40 @@ mod tests {
         channel: Channel,
         msg_size: usize,
     ) {
-        println!(
-            "Sending {} messages... {:?} {}",
-            MSG_COUNT, channel, msg_size
-        );
+        println!("Sending {MSG_COUNT} messages... {channel:?} {msg_size}");
         let cctrl = match channel.reliability {
             Reliability::Reliable => CongestionControl::Block,
             Reliability::BestEffort => CongestionControl::Drop,
         };
         // Create the message to send
-        let message: NetworkMessage = Push {
+        let message = NetworkMessage::from(Push {
             wire_expr: "test".into(),
             ext_qos: QoSType::new(channel.priority, cctrl, false),
-            ext_tstamp: None,
-            ext_nodeid: NodeIdType::default(),
-            payload: Put {
-                payload: vec![0u8; msg_size].into(),
-                timestamp: None,
-                encoding: Encoding::default(),
-                ext_sinfo: None,
-                #[cfg(feature = "shared-memory")]
-                ext_shm: None,
-                ext_attachment: None,
-                ext_unknown: vec![],
-            }
-            .into(),
-        }
-        .into();
+            ..Push::from(vec![0u8; msg_size])
+        });
         for _ in 0..MSG_COUNT {
-            let _ = client_transport.schedule(message.clone());
+            let _ = client_transport.schedule(message.clone().as_mut());
         }
 
         match channel.reliability {
             Reliability::Reliable => {
                 ztimeout!(async {
                     while router_handler.get_count() != MSG_COUNT {
-                        task::sleep(SLEEP_COUNT).await;
+                        tokio::time::sleep(SLEEP_COUNT).await;
                     }
                 });
             }
             Reliability::BestEffort => {
                 ztimeout!(async {
                     while router_handler.get_count() == 0 {
-                        task::sleep(SLEEP_COUNT).await;
+                        tokio::time::sleep(SLEEP_COUNT).await;
                     }
                 });
             }
         };
 
         // Wait a little bit
-        task::sleep(SLEEP).await;
+        tokio::time::sleep(SLEEP).await;
     }
 
     async fn run_single(
@@ -344,8 +310,7 @@ mod tests {
         lowlatency_transport: bool,
     ) {
         println!(
-            "\n>>> Running test for:  {:?}, {:?}, {:?}, {}",
-            client_endpoints, server_endpoints, channel, msg_size
+            "\n>>> Running test for:  {client_endpoints:?}, {server_endpoints:?}, {channel:?}, {msg_size}"
         );
 
         #[allow(unused_variables)] // Used when stats feature is enabled
@@ -359,20 +324,6 @@ mod tests {
             msg_size,
         )
         .await;
-
-        #[cfg(feature = "stats")]
-        {
-            let c_stats = client_transport.get_stats().unwrap().report();
-            println!("\tClient: {:?}", c_stats);
-            let r_stats = router_manager
-                .get_transport_unicast(&client_manager.config.zid)
-                .await
-                .unwrap()
-                .get_stats()
-                .map(|s| s.report())
-                .unwrap();
-            println!("\tRouter: {:?}", r_stats);
-        }
 
         close_transport(
             router_manager,
@@ -427,12 +378,9 @@ mod tests {
     }
 
     #[cfg(feature = "transport_tcp")]
-    #[test]
-    fn transport_unicast_compression_tcp_only() {
-        let _ = env_logger::try_init();
-        task::block_on(async {
-            zasync_executor_init!();
-        });
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn transport_unicast_compression_tcp_only() {
+        zenoh_util::init_log_from_env_or("error");
 
         // Define the locators
         let endpoints: Vec<EndPoint> = vec![
@@ -442,7 +390,7 @@ mod tests {
         // Define the reliability and congestion control
         let channel = [
             Channel {
-                priority: Priority::default(),
+                priority: Priority::DEFAULT,
                 reliability: Reliability::Reliable,
             },
             Channel {
@@ -451,28 +399,20 @@ mod tests {
             },
         ];
         // Run
-        task::block_on(run_with_universal_transport(
-            &endpoints,
-            &endpoints,
-            &channel,
-            &MSG_SIZE_ALL,
-        ));
+        run_with_universal_transport(&endpoints, &endpoints, &channel, &MSG_SIZE_ALL).await;
     }
 
     #[cfg(feature = "transport_tcp")]
-    #[test]
-    fn transport_unicast_compression_tcp_only_with_lowlatency_transport() {
-        let _ = env_logger::try_init();
-        task::block_on(async {
-            zasync_executor_init!();
-        });
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn transport_unicast_compression_tcp_only_with_lowlatency_transport() {
+        zenoh_util::init_log_from_env_or("error");
 
         // Define the locators
         let endpoints: Vec<EndPoint> = vec![format!("tcp/127.0.0.1:{}", 19100).parse().unwrap()];
         // Define the reliability and congestion control
         let channel = [
             Channel {
-                priority: Priority::default(),
+                priority: Priority::DEFAULT,
                 reliability: Reliability::Reliable,
             },
             Channel {
@@ -481,21 +421,13 @@ mod tests {
             },
         ];
         // Run
-        task::block_on(run_with_lowlatency_transport(
-            &endpoints,
-            &endpoints,
-            &channel,
-            &MSG_SIZE_LOWLATENCY,
-        ));
+        run_with_lowlatency_transport(&endpoints, &endpoints, &channel, &MSG_SIZE_LOWLATENCY).await;
     }
 
     #[cfg(feature = "transport_udp")]
-    #[test]
-    fn transport_unicast_compression_udp_only() {
-        let _ = env_logger::try_init();
-        task::block_on(async {
-            zasync_executor_init!();
-        });
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn transport_unicast_compression_udp_only() {
+        zenoh_util::init_log_from_env_or("error");
 
         // Define the locator
         let endpoints: Vec<EndPoint> = vec![
@@ -505,7 +437,7 @@ mod tests {
         // Define the reliability and congestion control
         let channel = [
             Channel {
-                priority: Priority::default(),
+                priority: Priority::DEFAULT,
                 reliability: Reliability::BestEffort,
             },
             Channel {
@@ -514,28 +446,20 @@ mod tests {
             },
         ];
         // Run
-        task::block_on(run_with_universal_transport(
-            &endpoints,
-            &endpoints,
-            &channel,
-            &MSG_SIZE_NOFRAG,
-        ));
+        run_with_universal_transport(&endpoints, &endpoints, &channel, &MSG_SIZE_NOFRAG).await;
     }
 
     #[cfg(feature = "transport_udp")]
-    #[test]
-    fn transport_unicast_compression_udp_only_with_lowlatency_transport() {
-        let _ = env_logger::try_init();
-        task::block_on(async {
-            zasync_executor_init!();
-        });
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn transport_unicast_compression_udp_only_with_lowlatency_transport() {
+        zenoh_util::init_log_from_env_or("error");
 
         // Define the locator
         let endpoints: Vec<EndPoint> = vec![format!("udp/127.0.0.1:{}", 19110).parse().unwrap()];
         // Define the reliability and congestion control
         let channel = [
             Channel {
-                priority: Priority::default(),
+                priority: Priority::DEFAULT,
                 reliability: Reliability::BestEffort,
             },
             Channel {
@@ -544,11 +468,6 @@ mod tests {
             },
         ];
         // Run
-        task::block_on(run_with_lowlatency_transport(
-            &endpoints,
-            &endpoints,
-            &channel,
-            &MSG_SIZE_NOFRAG,
-        ));
+        run_with_lowlatency_transport(&endpoints, &endpoints, &channel, &MSG_SIZE_NOFRAG).await;
     }
 }

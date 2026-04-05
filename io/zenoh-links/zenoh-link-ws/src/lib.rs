@@ -16,14 +16,17 @@
 //!
 //! This crate is intended for Zenoh's internal use.
 //!
-//! [Click here for Zenoh's documentation](../zenoh/index.html)
-use async_std::net::ToSocketAddrs;
+//! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
+use std::{net::SocketAddr, str::FromStr};
+
 use async_trait::async_trait;
-use std::net::SocketAddr;
 use url::Url;
 use zenoh_core::zconfigurable;
 use zenoh_link_commons::LocatorInspector;
-use zenoh_protocol::core::{endpoint::Address, Locator};
+use zenoh_protocol::{
+    core::{endpoint::Address, Locator, Metadata, Reliability},
+    transport::BatchSize,
+};
 use zenoh_result::{bail, ZResult};
 mod unicast;
 pub use unicast::*;
@@ -34,9 +37,11 @@ pub use unicast::*;
 //       adopted in Zenoh and the usage of 16 bits in Zenoh to encode the
 //       payload length in byte-streamed, the TCP MTU is constrained to
 //       2^16 - 1 bytes (i.e., 65535).
-const WS_MAX_MTU: u16 = u16::MAX;
+const WS_MAX_MTU: BatchSize = BatchSize::MAX;
 
 pub const WS_LOCATOR_PREFIX: &str = "ws";
+
+const IS_RELIABLE: bool = true;
 
 #[derive(Default, Clone, Copy)]
 pub struct WsLocatorInspector;
@@ -48,18 +53,31 @@ impl LocatorInspector for WsLocatorInspector {
     async fn is_multicast(&self, _locator: &Locator) -> ZResult<bool> {
         Ok(false)
     }
+
+    fn is_reliable(&self, locator: &Locator) -> ZResult<bool> {
+        if let Some(reliability) = locator
+            .metadata()
+            .get(Metadata::RELIABILITY)
+            .map(Reliability::from_str)
+            .transpose()?
+        {
+            Ok(reliability == Reliability::Reliable)
+        } else {
+            Ok(IS_RELIABLE)
+        }
+    }
 }
 
 zconfigurable! {
     // Default MTU (TCP PDU) in bytes.
-    static ref WS_DEFAULT_MTU: u16 = WS_MAX_MTU;
+    static ref WS_DEFAULT_MTU: BatchSize = WS_MAX_MTU;
     // Amount of time in microseconds to throttle the accept loop upon an error.
     // Default set to 100 ms.
     static ref TCP_ACCEPT_THROTTLE_TIME: u64 = 100_000;
 }
 
 pub async fn get_ws_addr(address: Address<'_>) -> ZResult<SocketAddr> {
-    match address.as_str().to_socket_addrs().await?.next() {
+    match tokio::net::lookup_host(address.as_str()).await?.next() {
         Some(addr) => Ok(addr),
         None => bail!("Couldn't resolve WebSocket locator address: {}", address),
     }

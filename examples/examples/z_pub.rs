@@ -11,40 +11,52 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use async_std::task::sleep;
-use clap::Parser;
 use std::time::Duration;
-use zenoh::config::Config;
-use zenoh::prelude::r#async::*;
+
+use clap::Parser;
+use zenoh::{bytes::Encoding, key_expr::KeyExpr, Config};
 use zenoh_examples::CommonArgs;
 
-#[async_std::main]
+#[tokio::main]
 async fn main() {
     // Initiate logging
-    env_logger::init();
+    zenoh::init_log_from_env_or("error");
 
-    let (config, key_expr, value, attachment) = parse_args();
+    let (config, key_expr, payload, attachment, add_matching_listener) = parse_args();
 
     println!("Opening session...");
-    let session = zenoh::open(config).res().await.unwrap();
+    let session = zenoh::open(config).await.unwrap();
 
     println!("Declaring Publisher on '{key_expr}'...");
-    let publisher = session.declare_publisher(&key_expr).res().await.unwrap();
+    let publisher = session.declare_publisher(&key_expr).await.unwrap();
 
+    if add_matching_listener {
+        publisher
+            .matching_listener()
+            .callback(|matching_status| {
+                if matching_status.matching() {
+                    println!("Publisher has matching subscribers.");
+                } else {
+                    println!("Publisher has NO MORE matching subscribers.");
+                }
+            })
+            .background()
+            .await
+            .unwrap();
+    }
+
+    println!("Press CTRL-C to quit...");
     for idx in 0..u32::MAX {
-        sleep(Duration::from_secs(1)).await;
-        let buf = format!("[{idx:4}] {value}");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let buf = format!("[{idx:4}] {payload}");
         println!("Putting Data ('{}': '{}')...", &key_expr, buf);
-        let mut put = publisher.put(buf);
-        if let Some(attachment) = &attachment {
-            put = put.with_attachment(
-                attachment
-                    .split('&')
-                    .map(|pair| split_once(pair, '='))
-                    .collect(),
-            )
-        }
-        put.res().await.unwrap();
+        // Refer to z_bytes.rs to see how to serialize different types of message
+        publisher
+            .put(buf)
+            .encoding(Encoding::TEXT_PLAIN) // Optionally set the encoding metadata 
+            .attachment(attachment.clone()) // Optionally add an attachment
+            .await
+            .unwrap();
     }
 }
 
@@ -54,29 +66,25 @@ struct Args {
     /// The key expression to write to.
     key: KeyExpr<'static>,
     #[arg(short, long, default_value = "Pub from Rust!")]
-    /// The value to write.
-    value: String,
+    /// The payload to write.
+    payload: String,
     #[arg(short, long)]
     /// The attachments to add to each put.
-    ///
-    /// The key-value pairs are &-separated, and = serves as the separator between key and value.
     attach: Option<String>,
+    /// Enable matching listener.
+    #[arg(long)]
+    add_matching_listener: bool,
     #[command(flatten)]
     common: CommonArgs,
 }
 
-fn split_once(s: &str, c: char) -> (&[u8], &[u8]) {
-    let s_bytes = s.as_bytes();
-    match s.find(c) {
-        Some(index) => {
-            let (l, r) = s_bytes.split_at(index);
-            (l, &r[1..])
-        }
-        None => (s_bytes, &[]),
-    }
-}
-
-fn parse_args() -> (Config, KeyExpr<'static>, String, Option<String>) {
+fn parse_args() -> (Config, KeyExpr<'static>, String, Option<String>, bool) {
     let args = Args::parse();
-    (args.common.into(), args.key, args.value, args.attach)
+    (
+        args.common.into(),
+        args.key,
+        args.payload,
+        args.attach,
+        args.add_matching_listener,
+    )
 }

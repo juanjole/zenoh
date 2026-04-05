@@ -12,8 +12,10 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use alloc::{borrow::ToOwned, boxed::Box, string::String, vec::Vec};
-use core::fmt::{Debug, Display, Formatter};
-use core::num::NonZeroUsize;
+use core::{
+    fmt::{Debug, Display, Formatter},
+    num::NonZeroUsize,
+};
 
 enum CowStrInner<'a> {
     Borrowed(&'a str),
@@ -21,7 +23,7 @@ enum CowStrInner<'a> {
 }
 pub struct CowStr<'a>(CowStrInner<'a>);
 impl<'a> CowStr<'a> {
-    pub(crate) fn borrowed(s: &'a str) -> Self {
+    pub(crate) const fn borrowed(s: &'a str) -> Self {
         Self(CowStrInner::Borrowed(s))
     }
     pub fn as_str(&self) -> &str {
@@ -41,7 +43,7 @@ impl<'a> From<&'a str> for CowStr<'a> {
         CowStr::borrowed(value)
     }
 }
-impl<'a> From<String> for CowStr<'a> {
+impl From<String> for CowStr<'_> {
     fn from(s: String) -> Self {
         if s.is_empty() {
             CowStr::borrowed("")
@@ -68,7 +70,7 @@ impl core::ops::Deref for CowStr<'_> {
         }
     }
 }
-impl<'a> Clone for CowStr<'a> {
+impl Clone for CowStr<'_> {
     fn clone(&self) -> Self {
         self.as_str().to_owned().into()
     }

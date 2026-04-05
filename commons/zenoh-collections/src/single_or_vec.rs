@@ -12,7 +12,9 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
-use alloc::{vec, vec::Vec};
+use alloc::vec;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 use core::{
     cmp::PartialEq,
     fmt, iter,
@@ -27,6 +29,11 @@ enum SingleOrVecInner<T> {
 }
 
 impl<T> SingleOrVecInner<T> {
+    const fn empty() -> Self {
+        SingleOrVecInner::Vec(Vec::new())
+    }
+
+    #[inline(always)]
     fn push(&mut self, value: T) {
         match self {
             SingleOrVecInner::Vec(vec) if vec.capacity() == 0 => *self = Self::Single(value),
@@ -50,11 +57,12 @@ where
 
 impl<T> Default for SingleOrVecInner<T> {
     fn default() -> Self {
-        SingleOrVecInner::Vec(Vec::new())
+        Self::empty()
     }
 }
 
 impl<T> AsRef<[T]> for SingleOrVecInner<T> {
+    #[inline(always)]
     fn as_ref(&self) -> &[T] {
         match self {
             SingleOrVecInner::Single(t) => slice::from_ref(t),
@@ -85,6 +93,11 @@ where
 pub struct SingleOrVec<T>(SingleOrVecInner<T>);
 
 impl<T> SingleOrVec<T> {
+    pub const fn empty() -> Self {
+        Self(SingleOrVecInner::empty())
+    }
+
+    #[inline(always)]
     pub fn push(&mut self, value: T) {
         self.0.push(value);
     }
@@ -101,6 +114,7 @@ impl<T> SingleOrVec<T> {
         self.truncate(0);
     }
 
+    #[inline(always)]
     pub fn len(&self) -> usize {
         match &self.0 {
             SingleOrVecInner::Single(_) => 1,
@@ -153,7 +167,7 @@ impl<T> SingleOrVec<T> {
             SingleOrVecInner::Vec(v) => v.last_mut(),
         }
     }
-    pub fn drain<Range: RangeBounds<usize>>(&mut self, range: Range) -> Drain<T> {
+    pub fn drain<Range: RangeBounds<usize>>(&mut self, range: Range) -> Drain<'_, T> {
         match &mut self.0 {
             this @ SingleOrVecInner::Single(_) if range.contains(&0) => Drain {
                 inner: DrainInner::Single(this),
@@ -171,15 +185,18 @@ impl<T> SingleOrVec<T> {
         self.vectorize().insert(at, value);
     }
 }
+
 enum DrainInner<'a, T> {
     Vec(alloc::vec::Drain<'a, T>),
     Single(&'a mut SingleOrVecInner<T>),
     Done,
 }
+
 pub struct Drain<'a, T> {
     inner: DrainInner<'a, T>,
 }
-impl<'a, T> Iterator for Drain<'a, T> {
+
+impl<T> Iterator for Drain<'_, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -196,7 +213,7 @@ impl<'a, T> Iterator for Drain<'a, T> {
         }
     }
 }
-impl<'a, T> Drop for Drain<'a, T> {
+impl<T> Drop for Drain<'_, T> {
     fn drop(&mut self) {
         if let DrainInner::Single(_) = self.inner {
             self.next();
@@ -211,6 +228,7 @@ impl<T> Default for SingleOrVec<T> {
 }
 
 impl<T> AsRef<[T]> for SingleOrVec<T> {
+    #[inline(always)]
     fn as_ref(&self) -> &[T] {
         self.0.as_ref()
     }

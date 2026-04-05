@@ -17,6 +17,15 @@
 # MacOS Related
 .DS_Store
 
+# VS Code
 .vscode
 
+# Zed
+.zed
+
 cargo-timing*.html
+
+ci/valgrind-check/*.log
+
+# Code coverage reports
+*.profraw

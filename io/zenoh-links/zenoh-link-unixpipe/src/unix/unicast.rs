@@ -11,38 +11,45 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::config;
+use std::{
+    cell::UnsafeCell,
+    collections::HashMap,
+    fmt,
+    fs::{File, OpenOptions},
+    io::{ErrorKind, Read, Write},
+    os::unix::fs::OpenOptionsExt,
+    sync::Arc,
+};
+
 #[cfg(not(target_os = "macos"))]
 use advisory_lock::{AdvisoryFileLock, FileLockMode};
-use async_io::Async;
-use async_std::fs::remove_file;
-use async_std::task::JoinHandle;
 use async_trait::async_trait;
 use filepath::FilePath;
-use nix::libc;
-use nix::unistd::unlink;
+use nix::{libc, unistd::unlink};
 use rand::Rng;
-use std::cell::UnsafeCell;
-use std::collections::HashMap;
-use std::fmt;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::sync::Arc;
-use zenoh_core::{zasyncread, zasyncwrite};
-use zenoh_protocol::core::{EndPoint, Locator};
-
+use tokio::{
+    fs::remove_file,
+    io::{unix::AsyncFd, Interest},
+    task::JoinHandle,
+};
+use tokio_util::sync::CancellationToken;
 use unix_named_pipe::{create, open_write};
-
+use zenoh_core::{zasyncread, zasyncwrite, ResolveFuture, Wait};
 use zenoh_link_commons::{
-    ConstructibleLinkManagerUnicast, LinkManagerUnicastTrait, LinkUnicast, LinkUnicastTrait,
-    NewLinkChannelSender,
+    ConstructibleLinkManagerUnicast, LinkAuthId, LinkManagerUnicastTrait, LinkUnicast,
+    LinkUnicastTrait, NewLinkChannelSender,
+};
+use zenoh_protocol::{
+    core::{EndPoint, Locator, Priority},
+    transport::BatchSize,
 };
 use zenoh_result::{bail, ZResult};
+use zenoh_runtime::ZRuntime;
 
 use super::FILE_ACCESS_MASK;
+use crate::config;
 
-const LINUX_PIPE_MAX_MTU: u16 = 65_535;
+const LINUX_PIPE_MAX_MTU: BatchSize = BatchSize::MAX;
 const LINUX_PIPE_DEDICATE_TRIES: usize = 100;
 
 static PIPE_INVITATION: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
@@ -77,12 +84,12 @@ impl Invitation {
     }
 
     async fn expect(expected_suffix: u32, pipe: &mut PipeR) -> ZResult<()> {
-        let recived_suffix = Self::receive(pipe).await?;
-        if recived_suffix != expected_suffix {
+        let received_suffix = Self::receive(pipe).await?;
+        if received_suffix != expected_suffix {
             bail!(
                 "Suffix mismatch: expected {} got {}",
                 expected_suffix,
-                recived_suffix
+                received_suffix
             )
         }
         Ok(())
@@ -90,12 +97,12 @@ impl Invitation {
 }
 
 struct PipeR {
-    pipe: Async<File>,
+    pipe: AsyncFd<File>,
 }
 
 impl Drop for PipeR {
     fn drop(&mut self) {
-        if let Ok(path) = self.pipe.as_mut().path() {
+        if let Ok(path) = self.pipe.get_ref().path() {
             let _ = unlink(&path);
         }
     }
@@ -105,38 +112,38 @@ impl PipeR {
         // create, open and lock named pipe
         let pipe_file = Self::create_and_open_unique_pipe_for_read(path, access_mode).await?;
         // create async_io wrapper for pipe's file descriptor
-        let pipe = Async::new(pipe_file)?;
+        let pipe = AsyncFd::new(pipe_file)?;
         Ok(Self { pipe })
     }
 
     async fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> ZResult<usize> {
         let result = self
             .pipe
-            .read_with_mut(|pipe| match pipe.read(&mut buf[..]) {
-                Ok(0) => Err(async_std::io::ErrorKind::WouldBlock.into()),
+            .async_io_mut(Interest::READABLE, |pipe| match pipe.read(&mut buf[..]) {
+                Ok(0) => Err(ErrorKind::WouldBlock.into()),
                 Ok(val) => Ok(val),
                 Err(e) => Err(e),
             })
             .await?;
-        ZResult::Ok(result)
+        Ok(result)
     }
 
     async fn read_exact<'a>(&'a mut self, buf: &'a mut [u8]) -> ZResult<()> {
         let mut r: usize = 0;
         self.pipe
-            .read_with_mut(|pipe| match pipe.read(&mut buf[r..]) {
-                Ok(0) => Err(async_std::io::ErrorKind::WouldBlock.into()),
+            .async_io_mut(Interest::READABLE, |pipe| match pipe.read(&mut buf[r..]) {
+                Ok(0) => Err(ErrorKind::WouldBlock.into()),
                 Ok(val) => {
                     r += val;
                     if r == buf.len() {
                         return Ok(());
                     }
-                    Err(async_std::io::ErrorKind::WouldBlock.into())
+                    Err(ErrorKind::WouldBlock.into())
                 }
                 Err(e) => Err(e),
             })
             .await?;
-        ZResult::Ok(())
+        Ok(())
     }
 
     async fn create_and_open_unique_pipe_for_read(path_r: &str, access_mode: u32) -> ZResult<File> {
@@ -170,59 +177,59 @@ impl PipeR {
             .open(path)?;
 
         #[cfg(not(target_os = "macos"))]
-        read.try_lock(FileLockMode::Exclusive)?;
+        AdvisoryFileLock::try_lock(&read, FileLockMode::Exclusive)?;
         Ok(read)
     }
 }
 
 struct PipeW {
-    pipe: Async<File>,
+    pipe: AsyncFd<File>,
 }
 impl PipeW {
     async fn new(path: &str) -> ZResult<Self> {
         // create, open and lock named pipe
         let pipe_file = Self::open_unique_pipe_for_write(path)?;
         // create async_io wrapper for pipe's file descriptor
-        let pipe = Async::new(pipe_file)?;
+        let pipe = AsyncFd::new(pipe_file)?;
         Ok(Self { pipe })
     }
 
     async fn write<'a>(&'a mut self, buf: &'a [u8]) -> ZResult<usize> {
         let result = self
             .pipe
-            .write_with_mut(|pipe| match pipe.write(buf) {
-                Ok(0) => Err(async_std::io::ErrorKind::WouldBlock.into()),
+            .async_io_mut(Interest::WRITABLE, |pipe| match pipe.write(buf) {
+                Ok(0) => Err(ErrorKind::WouldBlock.into()),
                 Ok(val) => Ok(val),
                 Err(e) => Err(e),
             })
             .await?;
-        ZResult::Ok(result)
+        Ok(result)
     }
 
     async fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> ZResult<()> {
         let mut r: usize = 0;
         self.pipe
-            .write_with_mut(|pipe| match pipe.write(&buf[r..]) {
-                Ok(0) => Err(async_std::io::ErrorKind::WouldBlock.into()),
+            .async_io_mut(Interest::WRITABLE, |pipe| match pipe.write(&buf[r..]) {
+                Ok(0) => Err(ErrorKind::WouldBlock.into()),
                 Ok(val) => {
                     r += val;
                     if r == buf.len() {
                         return Ok(());
                     }
-                    Err(async_std::io::ErrorKind::WouldBlock.into())
+                    Err(ErrorKind::WouldBlock.into())
                 }
                 Err(e) => Err(e),
             })
             .await?;
-        ZResult::Ok(())
+        Ok(())
     }
 
     fn open_unique_pipe_for_write(path: &str) -> ZResult<File> {
         let write = open_write(path)?;
         // the file must be already locked at the other side...
         #[cfg(not(target_os = "macos"))]
-        if write.try_lock(FileLockMode::Exclusive).is_ok() {
-            let _ = write.unlock();
+        if AdvisoryFileLock::try_lock(&write, FileLockMode::Exclusive).is_ok() {
+            let _ = AdvisoryFileLock::unlock(&write);
             bail!("no listener...")
         }
         Ok(write)
@@ -240,7 +247,7 @@ async fn handle_incoming_connections(
     // read invitation from the request channel
     let suffix = Invitation::receive(request_channel).await?;
 
-    // gererate uplink and downlink names
+    // generate uplink and downlink names
     let (dedicated_downlink_path, dedicated_uplink_path) =
         get_dedicated_pipe_names(path_downlink, path_uplink, suffix);
 
@@ -248,10 +255,10 @@ async fn handle_incoming_connections(
     let mut dedicated_downlink = PipeW::new(&dedicated_downlink_path).await?;
     let mut dedicated_uplink = PipeR::new(&dedicated_uplink_path, access_mode).await?;
 
-    // confirm over the dedicated chanel
+    // confirm over the dedicated channel
     Invitation::confirm(suffix, &mut dedicated_downlink).await?;
 
-    // got confirmation over the dedicated chanel
+    // got confirmation over the dedicated channel
     Invitation::expect(suffix, &mut dedicated_uplink).await?;
 
     // create Locators
@@ -266,58 +273,67 @@ async fn handle_incoming_connections(
         endpoint.metadata(),
     )?;
 
+    let link = Arc::new(UnicastPipe {
+        r: UnsafeCell::new(dedicated_uplink),
+        w: UnsafeCell::new(dedicated_downlink),
+        local,
+        remote,
+    });
+
     // send newly established link to manager
-    manager
-        .send_async(LinkUnicast(Arc::new(UnicastPipe {
-            r: UnsafeCell::new(dedicated_uplink),
-            w: UnsafeCell::new(dedicated_downlink),
-            local,
-            remote,
-        })))
-        .await?;
+    manager.send_async(LinkUnicast(link)).await?;
 
     ZResult::Ok(())
 }
 
 struct UnicastPipeListener {
-    listening_task_handle: JoinHandle<ZResult<()>>,
     uplink_locator: Locator,
+    token: CancellationToken,
+    handle: JoinHandle<()>,
 }
 impl UnicastPipeListener {
     async fn listen(endpoint: EndPoint, manager: Arc<NewLinkChannelSender>) -> ZResult<Self> {
-        let (path_uplink, path_downlink, access_mode) = parse_pipe_endpoint(&endpoint);
-        let local = Locator::new(
-            endpoint.protocol(),
-            path_uplink.as_str(),
-            endpoint.metadata(),
-        )?;
+        let (path, access_mode) = endpoint_to_pipe_path(&endpoint);
+        let (path_uplink, path_downlink) = split_pipe_path(&path);
+        let local = Locator::new(endpoint.protocol(), path, endpoint.metadata())?;
 
         // create request channel
         let mut request_channel = PipeR::new(&path_uplink, access_mode).await?;
 
+        let token = CancellationToken::new();
+        let c_token = token.clone();
+
+        // WARN: The spawn_blocking is mandatory verified by the ping/pong test
         // create listening task
-        let listening_task_handle = async_std::task::spawn(async move {
-            loop {
-                let _ = handle_incoming_connections(
-                    &endpoint,
-                    &manager,
-                    &mut request_channel,
-                    &path_downlink,
-                    &path_uplink,
-                    access_mode,
-                )
-                .await;
-            }
+        let handle = tokio::task::spawn_blocking(move || {
+            ZRuntime::Acceptor.block_on(async move {
+                loop {
+                    tokio::select! {
+                        _ = handle_incoming_connections(
+                            &endpoint,
+                            &manager,
+                            &mut request_channel,
+                            &path_downlink,
+                            &path_uplink,
+                            access_mode,
+                        ) => {}
+
+                        _ = c_token.cancelled() => break
+                    }
+                }
+            })
         });
 
         Ok(Self {
-            listening_task_handle,
             uplink_locator: local,
+            token,
+            handle,
         })
     }
 
-    async fn stop_listening(self) {
-        self.listening_task_handle.cancel().await;
+    fn stop_listening(self) {
+        self.token.cancel();
+        let _ = ResolveFuture::new(self.handle).wait();
     }
 }
 
@@ -340,7 +356,7 @@ async fn create_pipe(
     // generate random suffix
     let suffix: u32 = rand::thread_rng().gen();
 
-    // gererate uplink and downlink names
+    // generate uplink and downlink names
     let (path_downlink, path_uplink) = get_dedicated_pipe_names(path_downlink, path_uplink, suffix);
 
     // try create uplink and downlink pipes to ensure that the selected suffix is available
@@ -369,14 +385,15 @@ async fn dedicate_pipe(
 struct UnicastPipeClient;
 impl UnicastPipeClient {
     async fn connect_to(endpoint: EndPoint) -> ZResult<UnicastPipe> {
-        let (path_uplink, path_downlink, access_mode) = parse_pipe_endpoint(&endpoint);
+        let (path, access_mode) = endpoint_to_pipe_path(&endpoint);
+        let (path_uplink, path_downlink) = split_pipe_path(&path);
 
         // open the request channel
         // this channel would be used to invite listener to the dedicated channel
         // listener owns the request channel, so failure of this call means that there is nobody listening on the provided endpoint
         let mut request_channel = PipeW::new(&path_uplink).await?;
 
-        // create dedicated channel prerequisities. The creation code also ensures that nobody else would use the same channel concurrently
+        // create dedicated channel prerequisites. The creation code also ensures that nobody else would use the same channel concurrently
         let (
             mut dedicated_downlink,
             dedicated_suffix,
@@ -384,10 +401,10 @@ impl UnicastPipeClient {
             dedicated_uplink_path,
         ) = dedicate_pipe(&path_uplink, &path_downlink, access_mode).await?;
 
-        // invite the listener to our dedicated channel over the requet channel
+        // invite the listener to our dedicated channel over the request channel
         Invitation::send(dedicated_suffix, &mut request_channel).await?;
 
-        // read responce that should be sent over the dedicated channel, confirming that everything is OK
+        // read response that should be sent over the dedicated channel, confirming that everything is OK
         // on the listener's side and it is already working with the dedicated channel
         Invitation::expect(dedicated_suffix, &mut dedicated_downlink).await?;
 
@@ -457,23 +474,23 @@ impl Drop for UnicastPipe {
 #[async_trait]
 impl LinkUnicastTrait for UnicastPipe {
     async fn close(&self) -> ZResult<()> {
-        log::trace!("Closing Unix Pipe link: {}", self);
+        tracing::trace!("Closing Unix Pipe link: {}", self);
         Ok(())
     }
 
-    async fn write(&self, buffer: &[u8]) -> ZResult<usize> {
+    async fn write(&self, buffer: &[u8], _priority: Option<Priority>) -> ZResult<usize> {
         self.get_w_mut().write(buffer).await
     }
 
-    async fn write_all(&self, buffer: &[u8]) -> ZResult<()> {
+    async fn write_all(&self, buffer: &[u8], _priority: Option<Priority>) -> ZResult<()> {
         self.get_w_mut().write_all(buffer).await
     }
 
-    async fn read(&self, buffer: &mut [u8]) -> ZResult<usize> {
+    async fn read(&self, buffer: &mut [u8], _priority: Option<Priority>) -> ZResult<usize> {
         self.get_r_mut().read(buffer).await
     }
 
-    async fn read_exact(&self, buffer: &mut [u8]) -> ZResult<()> {
+    async fn read_exact(&self, buffer: &mut [u8], _priority: Option<Priority>) -> ZResult<()> {
         self.get_r_mut().read_exact(buffer).await
     }
 
@@ -488,18 +505,30 @@ impl LinkUnicastTrait for UnicastPipe {
     }
 
     #[inline(always)]
-    fn get_mtu(&self) -> u16 {
+    fn get_mtu(&self) -> BatchSize {
         LINUX_PIPE_MAX_MTU
     }
 
     #[inline(always)]
+    fn get_interface_names(&self) -> Vec<String> {
+        // @TODO: Not supported for now
+        tracing::debug!("The get_interface_names for UnicastPipe is not supported");
+        vec![]
+    }
+
+    #[inline(always)]
     fn is_reliable(&self) -> bool {
-        true
+        super::IS_RELIABLE
     }
 
     #[inline(always)]
     fn is_streamed(&self) -> bool {
         true
+    }
+
+    #[inline(always)]
+    fn get_auth_id(&self) -> &LinkAuthId {
+        &LinkAuthId::Unixpipe
     }
 }
 
@@ -521,14 +550,14 @@ impl fmt::Debug for UnicastPipe {
 
 pub struct LinkManagerUnicastPipe {
     manager: Arc<NewLinkChannelSender>,
-    listeners: async_std::sync::RwLock<HashMap<EndPoint, UnicastPipeListener>>,
+    listeners: tokio::sync::RwLock<HashMap<EndPoint, UnicastPipeListener>>,
 }
 
 impl LinkManagerUnicastPipe {
     pub fn new(manager: NewLinkChannelSender) -> Self {
         Self {
             manager: Arc::new(manager),
-            listeners: async_std::sync::RwLock::new(HashMap::new()),
+            listeners: tokio::sync::RwLock::new(HashMap::new()),
         }
     }
 }
@@ -556,38 +585,38 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastPipe {
         let removed = zasyncwrite!(self.listeners).remove(endpoint);
         match removed {
             Some(val) => {
-                val.stop_listening().await;
+                val.stop_listening();
                 Ok(())
             }
             None => bail!("No listener found for endpoint {}", endpoint),
         }
     }
 
-    fn get_listeners(&self) -> Vec<EndPoint> {
-        async_std::task::block_on(async { zasyncread!(self.listeners) })
-            .keys()
-            .cloned()
-            .collect()
+    async fn get_listeners(&self) -> Vec<EndPoint> {
+        zasyncread!(self.listeners).keys().cloned().collect()
     }
 
-    fn get_locators(&self) -> Vec<Locator> {
-        async_std::task::block_on(async { zasyncread!(self.listeners) })
+    async fn get_locators(&self) -> Vec<Locator> {
+        zasyncread!(self.listeners)
             .values()
             .map(|v| v.uplink_locator.clone())
             .collect()
     }
 }
 
-fn parse_pipe_endpoint(endpoint: &EndPoint) -> (String, String, u32) {
-    let address = endpoint.address();
-    let path = address.as_str();
-    let path_uplink = path.to_string() + "_uplink";
-    let path_downlink = path.to_string() + "_downlink";
+fn endpoint_to_pipe_path(endpoint: &EndPoint) -> (String, u32) {
+    let path = endpoint.address().to_string();
     let access_mode = endpoint
         .config()
         .get(config::FILE_ACCESS_MASK)
         .map_or(*FILE_ACCESS_MASK, |val| {
             val.parse().unwrap_or(*FILE_ACCESS_MASK)
         });
-    (path_uplink, path_downlink, access_mode)
+    (path, access_mode)
+}
+
+fn split_pipe_path(path: &str) -> (String, String) {
+    let path_uplink = format!("{path}_uplink");
+    let path_downlink = format!("{path}_downlink");
+    (path_uplink, path_downlink)
 }

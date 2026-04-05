@@ -11,19 +11,22 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+use core::{mem, num::NonZeroUsize, option};
+
 use crate::{
     buffer::{Buffer, SplitBuffer},
     reader::HasReader,
     writer::{BacktrackableWriter, DidntWrite, HasWriter, Writer},
 };
-use alloc::vec::Vec;
-use core::{mem, num::NonZeroUsize, option};
 
 /// Allocate a vector with a given capacity and sets the length to that capacity.
 #[must_use]
 pub fn uninit(capacity: usize) -> Vec<u8> {
     let mut vbuf = Vec::with_capacity(capacity);
     // SAFETY: this operation is safe since we are setting the length equal to the allocated capacity.
+    // The caller is responsible for ensuring the memory is initialized before reading.
     #[allow(clippy::uninit_vec)]
     unsafe {
         vbuf.set_len(capacity);
@@ -60,7 +63,7 @@ impl SplitBuffer for Vec<u8> {
 }
 
 // Writer
-impl<'a> HasWriter for &'a mut Vec<u8> {
+impl HasWriter for &mut Vec<u8> {
     type Writer = Self;
 
     fn writer(self) -> Self::Writer {
@@ -68,13 +71,14 @@ impl<'a> HasWriter for &'a mut Vec<u8> {
     }
 }
 
-impl Writer for &mut Vec<u8> {
+impl Writer for Vec<u8> {
     fn write(&mut self, bytes: &[u8]) -> Result<NonZeroUsize, DidntWrite> {
         if bytes.is_empty() {
             return Err(DidntWrite);
         }
         self.extend_from_slice(bytes);
-        // SAFETY: this operation is safe since we early return in case bytes is empty
+        // SAFETY: this operation is safe since we early return in case bytes is empty,
+        // so bytes.len() is guaranteed to be non-zero.
         Ok(unsafe { NonZeroUsize::new_unchecked(bytes.len()) })
     }
 
@@ -82,34 +86,39 @@ impl Writer for &mut Vec<u8> {
         self.write(bytes).map(|_| ())
     }
 
+    fn remaining(&self) -> usize {
+        usize::MAX
+    }
+
     fn write_u8(&mut self, byte: u8) -> Result<(), DidntWrite> {
         self.push(byte);
         Ok(())
     }
 
-    fn remaining(&self) -> usize {
-        usize::MAX
-    }
-
-    fn with_slot<F>(&mut self, mut len: usize, f: F) -> Result<NonZeroUsize, DidntWrite>
+    /// # Safety
+    ///
+    /// The `write` closure must return the number of bytes actually written to the slice,
+    /// which must be less than or equal to `len`.
+    unsafe fn with_slot<F>(&mut self, mut len: usize, write: F) -> Result<NonZeroUsize, DidntWrite>
     where
         F: FnOnce(&mut [u8]) -> usize,
     {
         self.reserve(len);
 
-        // SAFETY: we already reserved len elements on the vector.
+        // SAFETY: we already reserved `len` elements on the vector.
         let s = crate::unsafe_slice_mut!(self.spare_capacity_mut(), ..len);
-        // SAFETY: converting MaybeUninit<u8> into [u8] is safe because we are going to write on it.
-        //         The returned len tells us how many bytes have been written so as to update the len accordingly.
-        len = unsafe { f(&mut *(s as *mut [mem::MaybeUninit<u8>] as *mut [u8])) };
-        // SAFETY: we already reserved len elements on the vector.
+        // SAFETY: converting `MaybeUninit<u8>` into `[u8]` is safe because we are going to write to it.
+        // The returned `len` tells us how many bytes have been written so as to update the length accordingly.
+        len = unsafe { write(&mut *(s as *mut [mem::MaybeUninit<u8>] as *mut [u8])) };
+        // SAFETY: we already reserved `len` elements on the vector and we are setting the length
+        // based on the number of bytes actually written by the closure.
         unsafe { self.set_len(self.len() + len) };
 
         NonZeroUsize::new(len).ok_or(DidntWrite)
     }
 }
 
-impl BacktrackableWriter for &mut Vec<u8> {
+impl BacktrackableWriter for Vec<u8> {
     type Mark = usize;
 
     fn mark(&mut self) -> Self::Mark {

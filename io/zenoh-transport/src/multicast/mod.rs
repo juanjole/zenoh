@@ -14,32 +14,32 @@ pub(crate) mod establishment;
 pub(crate) mod link;
 pub(crate) mod manager;
 pub(crate) mod rx;
-#[cfg(feature = "shared-memory")]
-pub(crate) mod shm;
 pub(crate) mod transport;
 pub(crate) mod tx;
 
-use super::common;
-use crate::{
-    multicast::link::TransportLinkMulticast, TransportMulticastEventHandler, TransportPeer,
+use std::{
+    fmt::{self, Write},
+    sync::{Arc, Weak},
 };
+
 pub use manager::{
     TransportManagerBuilderMulticast, TransportManagerConfigMulticast,
     TransportManagerParamsMulticast,
-};
-use std::{
-    fmt,
-    sync::{Arc, Weak},
 };
 use transport::TransportMulticastInner;
 use zenoh_core::{zcondfeat, zread};
 use zenoh_link::Link;
 use zenoh_protocol::{
     core::Bits,
-    network::NetworkMessage,
+    network::NetworkMessageMut,
     transport::{close, PrioritySn},
 };
 use zenoh_result::{zerror, ZResult};
+
+use super::common;
+use crate::{
+    multicast::link::TransportLinkMulticast, TransportMulticastEventHandler, TransportPeer,
+};
 
 /*************************************/
 /*       TRANSPORT MULTICAST         */
@@ -49,8 +49,6 @@ pub(crate) struct TransportConfigMulticast {
     pub(crate) sn_resolution: Bits,
     pub(crate) initial_sns: Box<[PrioritySn]>,
     pub(crate) link: TransportLinkMulticast,
-    #[cfg(feature = "shared-memory")]
-    pub(crate) is_shm: bool,
 }
 
 #[derive(Clone)]
@@ -92,7 +90,7 @@ impl TransportMulticast {
     #[inline(always)]
     pub fn get_link(&self) -> ZResult<Link> {
         let transport = self.get_transport()?;
-        Ok(transport.get_link().into())
+        Ok(Link::new_multicast(&transport.get_link().link))
     }
 
     #[inline(always)]
@@ -110,20 +108,15 @@ impl TransportMulticast {
         }
     }
 
+    /// Returns if the message has successfully been sent.
     #[inline(always)]
-    pub fn schedule(&self, message: NetworkMessage) -> ZResult<()> {
+    pub fn schedule(&self, message: NetworkMessageMut) -> ZResult<bool> {
         let transport = self.get_transport()?;
-        transport.schedule(message);
-        Ok(())
-    }
-
-    #[inline(always)]
-    pub fn handle_message(&self, message: NetworkMessage) -> ZResult<()> {
-        self.schedule(message)
+        transport.schedule(message)
     }
 
     #[cfg(feature = "stats")]
-    pub fn get_stats(&self) -> ZResult<Arc<common::stats::TransportStats>> {
+    pub fn get_stats(&self) -> ZResult<zenoh_stats::TransportStats> {
         Ok(self.get_transport()?.stats.clone())
     }
 }
@@ -147,12 +140,17 @@ impl fmt::Debug for TransportMulticast {
         match self.get_transport() {
             Ok(transport) => {
                 let is_shm = zcondfeat!("shared-memory", transport.is_shm(), false);
-                let peers: String = zread!(transport.peers)
-                    .iter()
-                    .map(|(l, p)| {
-                        format!("(locator: {}, zid: {}, whatami: {})", l, p.zid, p.whatami)
-                    })
-                    .collect();
+                let peers: String =
+                    zread!(transport.peers)
+                        .iter()
+                        .fold(String::new(), |mut output, (l, p)| {
+                            let _ = write!(
+                                output,
+                                "(locator: {}, zid: {}, whatami: {})",
+                                l, p.zid, p.whatami
+                            );
+                            output
+                        });
 
                 f.debug_struct("Transport Multicast")
                     .field("sn_resolution", &transport.get_sn_resolution())

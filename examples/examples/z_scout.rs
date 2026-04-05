@@ -11,28 +11,23 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use async_std::prelude::FutureExt;
-use zenoh::config::Config;
-use zenoh::prelude::r#async::*;
-use zenoh::scouting::WhatAmI;
+use zenoh::{config::WhatAmI, scout, Config};
 
-#[async_std::main]
+#[tokio::main]
 async fn main() {
     // initiate logging
-    env_logger::init();
+    zenoh::init_log_from_env_or("error");
 
     println!("Scouting...");
-    let receiver = zenoh::scout(WhatAmI::Peer | WhatAmI::Router, Config::default())
-        .res()
+    let receiver = scout(WhatAmI::Peer | WhatAmI::Router, Config::default())
         .await
         .unwrap();
 
-    let _ = async {
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
         while let Ok(hello) = receiver.recv_async().await {
             println!("{hello}");
         }
-    }
-    .timeout(std::time::Duration::from_secs(1))
+    })
     .await;
 
     // stop scouting

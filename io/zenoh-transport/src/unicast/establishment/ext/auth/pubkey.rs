@@ -11,8 +11,8 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::unicast::establishment::{ext::auth::id, AcceptFsm, OpenFsm};
-use async_std::sync::{Mutex, RwLock};
+use std::{collections::HashSet, fmt, ops::Deref, path::Path};
+
 use async_trait::async_trait;
 use rand::Rng;
 use rsa::{
@@ -20,7 +20,7 @@ use rsa::{
     traits::PublicKeyParts,
     BigUint, Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey,
 };
-use std::{collections::HashSet, fmt, ops::Deref, path::Path};
+use tokio::sync::{Mutex, RwLock};
 use zenoh_buffers::{
     reader::{DidntRead, HasReader, Reader},
     writer::{DidntWrite, HasWriter, Writer},
@@ -31,9 +31,12 @@ use zenoh_core::{bail, zasynclock, zasyncread, zerror, Error as ZError, Result a
 use zenoh_crypto::PseudoRng;
 use zenoh_protocol::common::{ZExtUnit, ZExtZBuf};
 
+use crate::unicast::establishment::{ext::auth::id, AcceptFsm, OpenFsm};
+
 mod ext {
-    use super::{id::PUBKEY, ZExtUnit, ZExtZBuf};
     use zenoh_protocol::{zextunit, zextzbuf};
+
+    use super::id::PUBKEY;
 
     pub(super) type InitSyn = zextzbuf!(PUBKEY, false);
     pub(super) type InitAck = zextzbuf!(PUBKEY, false);
@@ -76,7 +79,7 @@ impl AuthPubKey {
         Ok(())
     }
 
-    pub async fn from_config(config: &PubKeyConf) -> ZResult<Option<Self>> {
+    pub fn from_config(config: &PubKeyConf) -> ZResult<Option<Self>> {
         const S: &str = "PubKey extension - From config.";
 
         // First, check if PEM keys are provided
@@ -138,10 +141,10 @@ impl Deref for ZPublicKey {
 impl fmt::Debug for ZPublicKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for b in self.0.n().to_bytes_le() {
-            write!(f, "{:02x}", b)?;
+            write!(f, "{b:02x}")?;
         }
         for b in self.0.e().to_bytes_le() {
-            write!(f, "{:02x}", b)?;
+            write!(f, "{b:02x}")?;
         }
         Ok(())
     }
@@ -210,12 +213,14 @@ where
 /*************************************/
 /*             InitSyn               */
 /*************************************/
+/// ```text
 ///  7 6 5 4 3 2 1 0
 /// +-+-+-+-+-+-+-+-+
 /// ~  public key   ~
 /// +---------------+
 ///
 /// ZExtZBuf
+/// ```
 pub(crate) struct InitSyn {
     pub(crate) alice_pubkey: ZPublicKey,
 }
@@ -247,6 +252,7 @@ where
 /*************************************/
 /*             InitAck               */
 /*************************************/
+/// ```text
 ///  7 6 5 4 3 2 1 0
 /// +-+-+-+-+-+-+-+-+
 /// ~  public key   ~
@@ -255,6 +261,7 @@ where
 /// +---------------+
 ///
 /// ZExtZBuf
+/// ```
 pub(crate) struct InitAck {
     pub(crate) bob_pubkey: ZPublicKey,
     pub(crate) nonce_encrypted_with_alice_pubkey: Vec<u8>,
@@ -292,12 +299,14 @@ where
 /*************************************/
 /*             OpenSyn               */
 /*************************************/
+/// ```text
 ///  7 6 5 4 3 2 1 0
 /// +-+-+-+-+-+-+-+-+
 /// ~ ciphered nonce~
 /// +---------------+
 ///
 /// ZExtZBuf
+/// ```
 pub(crate) struct OpenSyn {
     pub(crate) nonce_encrypted_with_bob_pubkey: Vec<u8>,
 }
@@ -327,15 +336,6 @@ where
         })
     }
 }
-
-/*************************************/
-/*             OpenAck               */
-/*************************************/
-///  7 6 5 4 3 2 1 0
-/// +-+-+-+-+-+-+-+-+
-/// +---------------+
-///
-/// ZExtUnit
 
 pub(crate) struct AuthPubKeyFsm<'a> {
     inner: &'a RwLock<AuthPubKey>,
@@ -373,7 +373,7 @@ impl<'a> OpenFsm for &'a AuthPubKeyFsm<'a> {
         _input: Self::SendInitSynIn,
     ) -> Result<Self::SendInitSynOut, Self::Error> {
         const S: &str = "PubKey extension - Send InitSyn.";
-        log::trace!("{S}");
+        tracing::trace!("{S}");
 
         let init_syn = InitSyn {
             alice_pubkey: zasyncread!(self.inner).pub_key.clone(),
@@ -396,7 +396,7 @@ impl<'a> OpenFsm for &'a AuthPubKeyFsm<'a> {
         input: Self::RecvInitAckIn,
     ) -> Result<Self::RecvInitAckOut, Self::Error> {
         const S: &str = "PubKey extension - Recv InitAck.";
-        log::trace!("{S}");
+        tracing::trace!("{S}");
 
         let (state, mut ext) = input;
 
@@ -442,7 +442,7 @@ impl<'a> OpenFsm for &'a AuthPubKeyFsm<'a> {
         state: Self::SendOpenSynIn,
     ) -> Result<Self::SendOpenSynOut, Self::Error> {
         const S: &str = "PubKey extension - Send OpenSyn.";
-        log::trace!("{S}");
+        tracing::trace!("{S}");
 
         let open_syn = OpenSyn {
             nonce_encrypted_with_bob_pubkey: state.nonce.clone(),
@@ -549,7 +549,7 @@ impl<'a> AcceptFsm for &'a AuthPubKeyFsm<'a> {
         input: Self::RecvInitSynIn,
     ) -> Result<Self::RecvInitSynOut, Self::Error> {
         const S: &str = "PubKey extension - Recv InitSyn.";
-        log::trace!("{S}");
+        tracing::trace!("{S}");
 
         let (state, mut ext) = input;
 
@@ -587,7 +587,7 @@ impl<'a> AcceptFsm for &'a AuthPubKeyFsm<'a> {
         state: Self::SendInitAckIn,
     ) -> Result<Self::SendInitAckOut, Self::Error> {
         const S: &str = "PubKey extension - Send InitAck.";
-        log::trace!("{S}");
+        tracing::trace!("{S}");
 
         let init_ack = InitAck {
             bob_pubkey: zasyncread!(self.inner).pub_key.clone(),
@@ -611,7 +611,7 @@ impl<'a> AcceptFsm for &'a AuthPubKeyFsm<'a> {
         input: Self::RecvOpenSynIn,
     ) -> Result<Self::RecvOpenSynOut, Self::Error> {
         const S: &str = "PubKey extension - Recv OpenSyn.";
-        log::trace!("{S}");
+        tracing::trace!("{S}");
 
         let (state, mut ext) = input;
 
@@ -650,7 +650,7 @@ impl<'a> AcceptFsm for &'a AuthPubKeyFsm<'a> {
         _input: Self::SendOpenAckIn,
     ) -> Result<Self::SendOpenAckOut, Self::Error> {
         const S: &str = "PubKey extension - Send OpenAck.";
-        log::trace!("{S}");
+        tracing::trace!("{S}");
 
         Ok(Some(ZExtUnit::new()))
     }

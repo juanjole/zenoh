@@ -11,18 +11,8 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use super::common::priority::{TransportPriorityRx, TransportPriorityTx};
-use super::link::{TransportLinkMulticastConfigUniversal, TransportLinkMulticastUniversal};
-#[cfg(feature = "stats")]
-use crate::stats::TransportStats;
-use crate::{
-    multicast::{
-        link::TransportLinkMulticast, TransportConfigMulticast, TransportMulticastEventHandler,
-    },
-    TransportManager, TransportPeer, TransportPeerEventHandler,
-};
-use async_trait::async_trait;
 use std::{
+    cmp::min,
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -30,16 +20,30 @@ use std::{
     },
     time::Duration,
 };
+
+use tokio_util::sync::CancellationToken;
 use zenoh_core::{zcondfeat, zread, zwrite};
 use zenoh_link::{Link, Locator};
-use zenoh_protocol::core::Resolution;
-use zenoh_protocol::transport::{batch_size, Close, TransportMessage};
 use zenoh_protocol::{
-    core::{Bits, Field, Priority, WhatAmI, ZenohId},
-    transport::{close, Join},
+    core::{Bits, Field, Priority, Resolution, WhatAmI, ZenohIdProto},
+    transport::{batch_size, close, join::ext::PatchType, Close, Join, TransportMessage},
 };
 use zenoh_result::{bail, ZResult};
-use zenoh_util::{Timed, TimedEvent, TimedHandle, Timer};
+use zenoh_task::TaskController;
+
+use super::{
+    common::priority::{TransportPriorityRx, TransportPriorityTx},
+    link::{TransportLinkMulticastConfigUniversal, TransportLinkMulticastUniversal},
+};
+#[cfg(feature = "shared-memory")]
+use crate::shm_context::MulticastTransportShmContext;
+use crate::{
+    multicast::{
+        link::TransportLinkMulticast, TransportConfigMulticast, TransportMulticastEventHandler,
+    },
+    TransportManager, TransportPeer, TransportPeerEventHandler,
+};
+// use zenoh_util::{Timed, TimedEvent, TimedHandle, Timer};
 
 /*************************************/
 /*             TRANSPORT             */
@@ -48,42 +52,26 @@ use zenoh_util::{Timed, TimedEvent, TimedHandle, Timer};
 pub(super) struct TransportMulticastPeer {
     pub(super) version: u8,
     pub(super) locator: Locator,
-    pub(super) zid: ZenohId,
+    pub(super) zid: ZenohIdProto,
     pub(super) whatami: WhatAmI,
     pub(super) resolution: Resolution,
     pub(super) lease: Duration,
-    pub(super) whatchdog: Arc<AtomicBool>,
-    pub(super) handle: TimedHandle,
+    pub(super) is_active: Arc<AtomicBool>,
+    token: CancellationToken,
     pub(super) priority_rx: Box<[TransportPriorityRx]>,
     pub(super) handler: Arc<dyn TransportPeerEventHandler>,
+    pub(super) patch: PatchType,
+    #[cfg(feature = "stats")]
+    pub(super) stats: zenoh_stats::LinkStats,
 }
 
 impl TransportMulticastPeer {
-    pub(super) fn active(&self) {
-        self.whatchdog.store(true, Ordering::Release);
+    pub(super) fn set_active(&self) {
+        self.is_active.store(true, Ordering::Release);
     }
 
     pub(super) fn is_qos(&self) -> bool {
         self.priority_rx.len() == Priority::NUM
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct TransportMulticastPeerLeaseTimer {
-    pub(super) whatchdog: Arc<AtomicBool>,
-    locator: Locator,
-    transport: TransportMulticastInner,
-}
-
-#[async_trait]
-impl Timed for TransportMulticastPeerLeaseTimer {
-    async fn run(&mut self) {
-        let is_active = self.whatchdog.swap(false, Ordering::AcqRel);
-        if !is_active {
-            let _ = self
-                .transport
-                .del_peer(&self.locator, close::reason::EXPIRED);
-        }
     }
 }
 
@@ -101,21 +89,28 @@ pub(crate) struct TransportMulticastInner {
     pub(super) link: Arc<RwLock<Option<TransportLinkMulticastUniversal>>>,
     // The callback
     pub(super) callback: Arc<RwLock<Option<Arc<dyn TransportMulticastEventHandler>>>>,
-    // The timer for peer leases
-    pub(super) timer: Arc<Timer>,
+    // Task controller for safe task cancellation
+    task_controller: TaskController,
     // Transport statistics
     #[cfg(feature = "stats")]
-    pub(super) stats: Arc<TransportStats>,
+    pub(super) stats: zenoh_stats::TransportStats,
+    #[cfg(feature = "stats")]
+    pub(super) link_stats: zenoh_stats::LinkStats,
+
+    #[cfg(feature = "shared-memory")]
+    pub(super) shm_context: Option<MulticastTransportShmContext>,
 }
 
 impl TransportMulticastInner {
     pub(super) fn make(
         manager: TransportManager,
         config: TransportConfigMulticast,
+
+        #[cfg(feature = "shared-memory")] shm_context: Option<MulticastTransportShmContext>,
     ) -> ZResult<TransportMulticastInner> {
         let mut priority_tx = vec![];
         if (config.initial_sns.len() != 1) != (config.initial_sns.len() != Priority::NUM) {
-            for (_, sn) in config.initial_sns.iter().enumerate() {
+            for sn in config.initial_sns.iter() {
                 let tct = TransportPriorityTx::make(config.sn_resolution)?;
                 tct.sync(*sn)?;
                 priority_tx.push(tct);
@@ -125,7 +120,11 @@ impl TransportMulticastInner {
         }
 
         #[cfg(feature = "stats")]
-        let stats = Arc::new(TransportStats::new(Some(manager.get_stats().clone())));
+        let stats = manager
+            .stats()
+            .multicast_transport_stats(config.link.link.get_dst().to_string());
+        #[cfg(feature = "stats")]
+        let link_stats = stats.link_stats(config.link.link.get_src(), config.link.link.get_dst());
 
         let ti = TransportMulticastInner {
             manager,
@@ -134,9 +133,13 @@ impl TransportMulticastInner {
             locator: config.link.link.get_dst().to_owned(),
             link: Arc::new(RwLock::new(None)),
             callback: Arc::new(RwLock::new(None)),
-            timer: Arc::new(Timer::new(false)),
+            task_controller: TaskController::default(),
             #[cfg(feature = "stats")]
             stats,
+            #[cfg(feature = "stats")]
+            link_stats,
+            #[cfg(feature = "shared-memory")]
+            shm_context,
         };
 
         let link = TransportLinkMulticastUniversal::new(ti.clone(), config.link);
@@ -165,7 +168,7 @@ impl TransportMulticastInner {
 
     #[cfg(feature = "shared-memory")]
     pub(crate) fn is_shm(&self) -> bool {
-        self.manager.config.multicast.is_shm
+        self.shm_context.is_some()
     }
 
     pub(crate) fn get_callback(&self) -> Option<Arc<dyn TransportMulticastEventHandler>> {
@@ -180,13 +183,9 @@ impl TransportMulticastInner {
     /*           TERMINATION             */
     /*************************************/
     pub(super) async fn delete(&self) -> ZResult<()> {
-        log::debug!("Closing multicast transport on {:?}", self.locator);
+        tracing::debug!("Closing multicast transport on {:?}", self.locator);
 
-        // Notify the callback that we are going to close the transport
         let callback = zwrite!(self.callback).take();
-        if let Some(cb) = callback.as_ref() {
-            cb.closing();
-        }
 
         // Delete the transport on the manager
         let _ = self.manager.del_transport_multicast(&self.locator).await;
@@ -202,11 +201,13 @@ impl TransportMulticastInner {
             cb.closed();
         }
 
+        self.task_controller.terminate_all_async().await;
+
         Ok(())
     }
 
     pub(crate) async fn close(&self, reason: u8) -> ZResult<()> {
-        log::trace!(
+        tracing::trace!(
             "Closing multicast transport of peer {}: {}",
             self.manager.config.zid,
             self.locator
@@ -257,7 +258,7 @@ impl TransportMulticastInner {
                     sn_resolution: self.manager.config.resolution.get(Field::FrameSN),
                     batch_size,
                 };
-                l.start_tx(config, self.priority_tx.clone(), &self.manager.tx_executor);
+                l.start_tx(config, self.priority_tx.clone());
                 Ok(())
             }
             None => {
@@ -333,7 +334,7 @@ impl TransportMulticastInner {
     /*               PEER                */
     /*************************************/
     pub(super) fn new_peer(&self, locator: &Locator, join: Join) -> ZResult<()> {
-        let mut link = Link::from(self.get_link());
+        let mut link = Link::new_multicast(&self.get_link().link);
         link.dst = locator.clone();
 
         let is_shm = zcondfeat!("shared-memory", join.ext_shm.is_some(), false);
@@ -344,6 +345,7 @@ impl TransportMulticastInner {
             #[cfg(feature = "shared-memory")]
             is_shm,
             links: vec![link],
+            region_name: None, // TODO(regions): region names are unsupported for multicast transports
         };
 
         let handler = match zread!(self.callback).as_ref() {
@@ -359,7 +361,7 @@ impl TransportMulticastInner {
         .into_boxed_slice();
 
         let mut priority_rx = Vec::with_capacity(next_sns.len());
-        for (_, sn) in next_sns.iter().enumerate() {
+        for sn in next_sns.iter() {
             let tprx = TransportPriorityRx::make(
                 join.resolution.get(Field::FrameSN),
                 self.manager.config.defrag_buff_size,
@@ -369,7 +371,7 @@ impl TransportMulticastInner {
         }
         let priority_rx = priority_rx.into_boxed_slice();
 
-        log::debug!(
+        tracing::debug!(
                 "New transport joined on {}: zid {}, whatami {}, resolution {:?}, locator {}, is_qos {}, is_shm {}, initial sn: {:?}",
                 self.locator,
                 peer.zid,
@@ -382,15 +384,33 @@ impl TransportMulticastInner {
             );
 
         // Create lease event
-        let whatchdog = Arc::new(AtomicBool::new(false));
-        let event = TransportMulticastPeerLeaseTimer {
-            whatchdog: whatchdog.clone(),
-            locator: locator.clone(),
-            transport: self.clone(),
+        // TODO(yuyuan): refine the clone behaviors
+        let is_active = Arc::new(AtomicBool::new(false));
+        let c_is_active = is_active.clone();
+        let token = self.task_controller.get_cancellation_token();
+        let c_token = token.clone();
+        let c_self = self.clone();
+        let c_locator = locator.clone();
+        let task = async move {
+            let mut interval =
+                tokio::time::interval_at(tokio::time::Instant::now() + join.lease, join.lease);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if !c_is_active.swap(false, Ordering::AcqRel) {
+                            break
+                        }
+                    }
+                    _ = c_token.cancelled() => break
+                }
+            }
+            let _ = c_self.del_peer(&c_locator, close::reason::EXPIRED);
         };
-        let event = TimedEvent::periodic(join.lease, event);
-        let handle = event.get_handle();
 
+        self.task_controller
+            .spawn_with_rt(zenoh_runtime::ZRuntime::Acceptor, task);
+
+        // TODO(yuyuan): Integrate the above async task into TransportMulticastPeer
         // Store the new peer
         let peer = TransportMulticastPeer {
             version: join.version,
@@ -399,15 +419,17 @@ impl TransportMulticastInner {
             whatami: peer.whatami,
             resolution: join.resolution,
             lease: join.lease,
-            whatchdog,
-            handle,
+            is_active,
+            token,
             priority_rx,
             handler,
+            patch: min(PatchType::CURRENT, join.ext_patch),
+            #[cfg(feature = "stats")]
+            stats: self
+                .stats
+                .peer_link_stats(peer.zid, peer.whatami, &self.link_stats),
         };
         zwrite!(self.peers).insert(locator.clone(), peer);
-
-        // Add the event to the timer
-        self.timer.add(event);
 
         Ok(())
     }
@@ -415,7 +437,7 @@ impl TransportMulticastInner {
     pub(super) fn del_peer(&self, locator: &Locator, reason: u8) -> ZResult<()> {
         let mut guard = zwrite!(self.peers);
         if let Some(peer) = guard.remove(locator) {
-            log::debug!(
+            tracing::debug!(
                 "Peer {}/{}/{} has left multicast {} with reason: {}",
                 peer.zid,
                 peer.whatami,
@@ -423,9 +445,9 @@ impl TransportMulticastInner {
                 self.locator,
                 reason
             );
-            peer.handle.clone().defuse();
 
-            peer.handler.closing();
+            // TODO(yuyuan): Unify the termination
+            peer.token.cancel();
             drop(guard);
             peer.handler.closed();
         }
@@ -436,7 +458,7 @@ impl TransportMulticastInner {
         zread!(self.peers)
             .values()
             .map(|p| {
-                let mut link = Link::from(self.get_link());
+                let mut link = Link::new_multicast(&self.get_link().link);
                 link.dst = p.locator.clone();
 
                 TransportPeer {
@@ -446,6 +468,7 @@ impl TransportMulticastInner {
                     #[cfg(feature = "shared-memory")]
                     is_shm: self.is_shm(),
                     links: vec![link],
+                    region_name: None,
                 }
             })
             .collect()

@@ -14,66 +14,41 @@
 
 //! # The plugin infrastructure for Zenoh.
 //!
+//! <div class="warning" style="background-color:#fff5d6;">This API has been marked as <strong>unstable</strong>: it works as advertised, but it may be changed in a future release.</div>
+//!
 //! To build a plugin, implement [`Plugin`].
 //!
-//! If building a plugin for [`zenohd`](https://crates.io/crates/zenoh), you should use the types exported in [`zenoh::plugins`](https://docs.rs/zenoh/latest/zenoh/plugins) to fill [`Plugin`]'s associated types.  
+//! If building a plugin for [`zenohd`](https://crates.io/crates/zenoh), you should use the types exported in [`zenoh::plugins`](https://docs.rs/zenoh/latest/zenoh/plugins) to fill [`Plugin`]'s associated types.
 //! To check your plugin typing for `zenohd`, have your plugin implement [`zenoh::plugins::ZenohPlugin`](https://docs.rs/zenoh/latest/zenoh/plugins/struct.ZenohPlugin)
-pub mod loading;
-pub mod vtable;
+//!
+//! Plugin is a struct which implements the [`Plugin`] trait. This trait has two associated types:
+//! - `StartArgs`: the type of the arguments passed to the plugin's [`start`](Plugin::start) function.
+//! - `Instance`: the type of the plugin's instance.
+//!
+//! The actual work of the plugin is performed by the instance, which is created by the [`start`](Plugin::start) function.
+//!
+//! Plugins are loaded, started and stopped by [`PluginsManager`]. Stopping plugin is just dropping it's instance.
+//!
+//! Plugins can be static and dynamic.
+//!
+//! Static plugin is just a type which implements [`Plugin`] trait. It can be added to [`PluginsManager`] by [`PluginsManager::declare_static_plugin`](crate::manager::PluginsManager::declare_static_plugin) method.
+//!
+//! Dynamic plugin is a shared library which exports set of C-repr (unmangled) functions which allows to check plugin compatibility and create plugin instance. These functions are defined automatically by [`declare_plugin`] macro.
+//!
+mod compatibility;
+mod manager;
+mod plugin;
+mod vtable;
 
-use zenoh_result::ZResult;
+pub use compatibility::{Compatibility, StructVersion};
+pub use manager::{DeclaredPlugin, LoadedPlugin, PluginsManager, StartedPlugin};
+pub use plugin::{
+    Plugin, PluginConditionSetter, PluginControl, PluginDiff, PluginInstance, PluginReport,
+    PluginStartArgs, PluginState, PluginStatus, PluginStatusRec,
+};
+pub use vtable::{PluginLoaderVersion, PluginVTable, PLUGIN_LOADER_VERSION};
 
-#[repr(C)]
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct Compatibility {
-    major: u64,
-    minor: u64,
-    patch: u64,
-    stable: bool,
-    commit: &'static str,
-}
-const RELEASE_AND_COMMIT: (&str, &str) = zenoh_macros::rustc_version_release!();
-impl Compatibility {
-    pub fn new() -> ZResult<Self> {
-        let (release, commit) = RELEASE_AND_COMMIT;
-        let (release, stable) = if let Some(p) = release.chars().position(|c| c == '-') {
-            (&release[..p], false)
-        } else {
-            (release, true)
-        };
-        let mut split = release.split('.').map(|s| s.trim());
-        Ok(Compatibility {
-            major: split.next().unwrap().parse().unwrap(),
-            minor: split.next().unwrap().parse().unwrap(),
-            patch: split.next().unwrap().parse().unwrap(),
-            stable,
-            commit,
-        })
-    }
-    pub fn are_compatible(a: &Self, b: &Self) -> bool {
-        if a.stable && b.stable {
-            a.major == b.major && a.minor == b.minor && a.patch == b.patch
-        } else {
-            a == b
-        }
-    }
-}
-
-pub mod prelude {
-    pub use crate::{loading::*, vtable::*, Plugin};
-}
-
-pub trait Plugin: Sized + 'static {
-    type StartArgs;
-    type RunningPlugin;
-    /// Your plugins' default name when statically linked.
-    const STATIC_NAME: &'static str;
-    /// You probabky don't need to override this function.
-    ///
-    /// Returns some build information on your plugin, allowing the host to detect potential ABI changes that would break it.
-    fn compatibility() -> ZResult<Compatibility> {
-        Compatibility::new()
-    }
-    /// Starts your plugin. Use `Ok` to return your plugin's control structure
-    fn start(name: &str, args: &Self::StartArgs) -> ZResult<Self::RunningPlugin>;
+#[doc(hidden)]
+pub mod export {
+    pub use git_version;
 }

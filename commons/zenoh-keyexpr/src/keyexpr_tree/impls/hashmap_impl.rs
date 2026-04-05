@@ -17,14 +17,15 @@ use core::hash::Hasher;
 // `SipHasher` is deprecated in favour of a symbol that only exists in `std`
 #[allow(deprecated)]
 use core::hash::SipHasher as DefaultHasher;
-#[cfg(not(feature = "std"))]
-use hashbrown::{
-    hash_map::{Entry, Iter, IterMut, Values, ValuesMut},
-    HashMap,
-};
 #[cfg(feature = "std")]
 use std::collections::{
     hash_map::{DefaultHasher, Entry, Iter, IterMut, Values, ValuesMut},
+    HashMap,
+};
+
+#[cfg(not(feature = "std"))]
+use hashbrown::{
+    hash_map::{Entry, Iter, IterMut, Values, ValuesMut},
     HashMap,
 };
 
@@ -45,6 +46,7 @@ impl<'a: 'b, 'b, T: HasChunk, S: core::hash::BuildHasher> IEntry<'a, 'b, T>
     fn get_or_insert_with<F: FnOnce(&'b keyexpr) -> T>(self, f: F) -> &'a mut T {
         match self {
             Entry::Vacant(entry) => {
+                // SAFETY: upheld by the surrounding invariants and prior validation.
                 let value = unsafe { f(core::mem::transmute::<&keyexpr, &keyexpr>(entry.key())) };
                 entry.insert(value)
             }
@@ -57,6 +59,7 @@ impl<'a: 'b, 'b, T: HasChunk> IEntry<'a, 'b, T> for Entry<'a, OwnedKeyExpr, T> {
     fn get_or_insert_with<F: FnOnce(&'b keyexpr) -> T>(self, f: F) -> &'a mut T {
         match self {
             Entry::Vacant(entry) => {
+                // SAFETY: upheld by the surrounding invariants and prior validation.
                 let value = unsafe { f(core::mem::transmute::<&keyexpr, &keyexpr>(entry.key())) };
                 entry.insert(value)
             }
@@ -86,9 +89,19 @@ impl<T: HasChunk + AsNode<T> + AsNodeMut<T> + 'static, S: core::hash::BuildHashe
     }
 
     #[cfg(feature = "std")]
-    type Entry<'a, 'b> = Entry<'a, OwnedKeyExpr, T> where Self: 'a, 'a: 'b, T: 'b;
+    type Entry<'a, 'b>
+        = Entry<'a, OwnedKeyExpr, T>
+    where
+        Self: 'a,
+        'a: 'b,
+        T: 'b;
     #[cfg(not(feature = "std"))]
-    type Entry<'a, 'b> = Entry<'a, OwnedKeyExpr, T, S> where Self: 'a, 'a: 'b, T: 'b;
+    type Entry<'a, 'b>
+        = Entry<'a, OwnedKeyExpr, T, S>
+    where
+        Self: 'a,
+        'a: 'b,
+        T: 'b;
     fn entry<'a, 'b>(&'a mut self, chunk: &'b keyexpr) -> Self::Entry<'a, 'b>
     where
         Self: 'a,
@@ -98,7 +111,10 @@ impl<T: HasChunk + AsNode<T> + AsNodeMut<T> + 'static, S: core::hash::BuildHashe
         self.entry(chunk.into())
     }
 
-    type Iter<'a> = Values<'a, OwnedKeyExpr, T> where Self: 'a;
+    type Iter<'a>
+        = Values<'a, OwnedKeyExpr, T>
+    where
+        Self: 'a;
     fn children<'a>(&'a self) -> Self::Iter<'a>
     where
         Self: 'a,
@@ -106,9 +122,10 @@ impl<T: HasChunk + AsNode<T> + AsNodeMut<T> + 'static, S: core::hash::BuildHashe
         self.values()
     }
 
-    type IterMut<'a> = ValuesMut<'a, OwnedKeyExpr, T>
-where
-    Self: 'a;
+    type IterMut<'a>
+        = ValuesMut<'a, OwnedKeyExpr, T>
+    where
+        Self: 'a;
 
     fn children_mut<'a>(&'a mut self) -> Self::IterMut<'a>
     where
@@ -121,28 +138,32 @@ where
         self.retain(|_, v| predicate(v));
     }
 
-    type Intersection<'a> = super::FilterMap<Iter<'a, OwnedKeyExpr, T>, super::Intersection<'a>>
+    type Intersection<'a>
+        = super::FilterMap<Iter<'a, OwnedKeyExpr, T>, super::Intersection<'a>>
     where
         Self: 'a,
         Self::Node: 'a;
     fn intersection<'a>(&'a self, key: &'a keyexpr) -> Self::Intersection<'a> {
         super::FilterMap::new(self.iter(), super::Intersection(key))
     }
-    type IntersectionMut<'a> = super::FilterMap<IterMut<'a, OwnedKeyExpr, T>, super::Intersection<'a>>
+    type IntersectionMut<'a>
+        = super::FilterMap<IterMut<'a, OwnedKeyExpr, T>, super::Intersection<'a>>
     where
         Self: 'a,
         Self::Node: 'a;
     fn intersection_mut<'a>(&'a mut self, key: &'a keyexpr) -> Self::IntersectionMut<'a> {
         super::FilterMap::new(self.iter_mut(), super::Intersection(key))
     }
-    type Inclusion<'a> = super::FilterMap<Iter<'a, OwnedKeyExpr, T>, super::Inclusion<'a>>
+    type Inclusion<'a>
+        = super::FilterMap<Iter<'a, OwnedKeyExpr, T>, super::Inclusion<'a>>
     where
         Self: 'a,
         Self::Node: 'a;
     fn inclusion<'a>(&'a self, key: &'a keyexpr) -> Self::Inclusion<'a> {
         super::FilterMap::new(self.iter(), super::Inclusion(key))
     }
-    type InclusionMut<'a> = super::FilterMap<IterMut<'a, OwnedKeyExpr, T>, super::Inclusion<'a>>
+    type InclusionMut<'a>
+        = super::FilterMap<IterMut<'a, OwnedKeyExpr, T>, super::Inclusion<'a>>
     where
         Self: 'a,
         Self::Node: 'a;

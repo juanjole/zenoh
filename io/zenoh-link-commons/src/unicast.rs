@@ -11,14 +11,20 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use async_trait::async_trait;
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::{
     fmt,
     hash::{Hash, Hasher},
     ops::Deref,
 };
-use zenoh_protocol::core::{EndPoint, Locator};
+use std::net::SocketAddr;
+
+use async_trait::async_trait;
+use serde::Serialize;
+use zenoh_protocol::{
+    core::{EndPoint, Locator, Priority},
+    transport::BatchSize,
+};
 use zenoh_result::ZResult;
 
 pub type LinkManagerUnicast = Arc<dyn LinkManagerUnicastTrait>;
@@ -27,10 +33,11 @@ pub trait LinkManagerUnicastTrait: Send + Sync {
     async fn new_link(&self, endpoint: EndPoint) -> ZResult<LinkUnicast>;
     async fn new_listener(&self, endpoint: EndPoint) -> ZResult<Locator>;
     async fn del_listener(&self, endpoint: &EndPoint) -> ZResult<()>;
-    fn get_listeners(&self) -> Vec<EndPoint>;
-    fn get_locators(&self) -> Vec<Locator>;
+    async fn get_listeners(&self) -> Vec<EndPoint>;
+    async fn get_locators(&self) -> Vec<Locator>;
 }
 pub type NewLinkChannelSender = flume::Sender<LinkUnicast>;
+
 pub trait ConstructibleLinkManagerUnicast<T>: Sized {
     fn new(new_link_sender: NewLinkChannelSender, config: T) -> ZResult<Self>;
 }
@@ -40,15 +47,20 @@ pub struct LinkUnicast(pub Arc<dyn LinkUnicastTrait>);
 
 #[async_trait]
 pub trait LinkUnicastTrait: Send + Sync {
-    fn get_mtu(&self) -> u16;
+    fn get_mtu(&self) -> BatchSize;
     fn get_src(&self) -> &Locator;
     fn get_dst(&self) -> &Locator;
     fn is_reliable(&self) -> bool;
     fn is_streamed(&self) -> bool;
-    async fn write(&self, buffer: &[u8]) -> ZResult<usize>;
-    async fn write_all(&self, buffer: &[u8]) -> ZResult<()>;
-    async fn read(&self, buffer: &mut [u8]) -> ZResult<usize>;
-    async fn read_exact(&self, buffer: &mut [u8]) -> ZResult<()>;
+    fn get_interface_names(&self) -> Vec<String>;
+    fn get_auth_id(&self) -> &LinkAuthId;
+    fn supports_priorities(&self) -> bool {
+        false
+    }
+    async fn write(&self, buffer: &[u8], priority: Option<Priority>) -> ZResult<usize>;
+    async fn write_all(&self, buffer: &[u8], priority: Option<Priority>) -> ZResult<()>;
+    async fn read(&self, buffer: &mut [u8], priority: Option<Priority>) -> ZResult<usize>;
+    async fn read_exact(&self, buffer: &mut [u8], priority: Option<Priority>) -> ZResult<()>;
     async fn close(&self) -> ZResult<()>;
 }
 
@@ -97,5 +109,47 @@ impl fmt::Debug for LinkUnicast {
 impl From<Arc<dyn LinkUnicastTrait>> for LinkUnicast {
     fn from(link: Arc<dyn LinkUnicastTrait>) -> LinkUnicast {
         LinkUnicast(link)
+    }
+}
+
+pub fn get_ip_interface_names(addr: &SocketAddr) -> Vec<String> {
+    match zenoh_util::net::get_interface_names_by_addr(addr.ip()) {
+        Ok(interfaces) => {
+            tracing::trace!("get_interface_names for {:?}: {:?}", addr.ip(), interfaces);
+            interfaces
+        }
+        Err(e) => {
+            tracing::debug!("get_interface_names for {:?} failed: {:?}", addr.ip(), e);
+            vec![]
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Hash, PartialEq, Eq)]
+pub enum LinkAuthId {
+    Tls(Option<String>),
+    Quic(Option<String>),
+    Tcp,
+    Udp,
+    Serial,
+    Unixpipe,
+    UnixsockStream,
+    Vsock,
+    Ws,
+}
+
+impl LinkAuthId {
+    pub fn get_cert_common_name(&self) -> Option<&str> {
+        match &self {
+            LinkAuthId::Tls(n) => n.as_ref().map(|s| s.as_ref()),
+            LinkAuthId::Quic(n) => n.as_ref().map(|s| s.as_ref()),
+            LinkAuthId::Tcp => None,
+            LinkAuthId::Udp => None,
+            LinkAuthId::Serial => None,
+            LinkAuthId::Unixpipe => None,
+            LinkAuthId::UnixsockStream => None,
+            LinkAuthId::Vsock => None,
+            LinkAuthId::Ws => None,
+        }
     }
 }

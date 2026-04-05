@@ -11,9 +11,11 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::common::ZExtUnknown;
 use alloc::vec::Vec;
+
 use uhlc::Timestamp;
+
+use crate::common::ZExtUnknown;
 
 /// # Put message
 ///
@@ -38,7 +40,7 @@ pub mod flag {
     pub const Z: u8 = 1 << 7; // 0x80 Extensions    if Z==1 then an extension will follow
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Del {
     pub timestamp: Option<Timestamp>,
     pub ext_sinfo: Option<ext::SourceInfoType>,
@@ -47,7 +49,7 @@ pub struct Del {
 }
 
 pub mod ext {
-    use crate::{common::ZExtZBuf, zextzbuf};
+    use crate::zextzbuf;
 
     /// # SourceInfo extension
     /// Used to carry additional information about the source of data
@@ -61,14 +63,16 @@ pub mod ext {
 
 impl Del {
     #[cfg(feature = "test")]
+    #[doc(hidden)]
     pub fn rand() -> Self {
-        use crate::{common::iext, core::ZenohId};
         use rand::Rng;
+
+        use crate::{common::iext, core::ZenohIdProto};
         let mut rng = rand::thread_rng();
 
         let timestamp = rng.gen_bool(0.5).then_some({
             let time = uhlc::NTP64(rng.gen());
-            let id = uhlc::ID::try_from(ZenohId::rand().to_le_bytes()).unwrap();
+            let id = uhlc::ID::try_from(ZenohIdProto::rand().to_le_bytes()).unwrap();
             Timestamp::new(time, id)
         });
         let ext_sinfo = rng.gen_bool(0.5).then_some(ext::SourceInfoType::rand());

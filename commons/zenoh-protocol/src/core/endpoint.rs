@@ -11,28 +11,17 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use super::locator::*;
-use alloc::{borrow::ToOwned, format, string::String, vec::Vec};
-use core::{convert::TryFrom, fmt, str::FromStr};
+use alloc::{borrow::ToOwned, format, string::String};
+use core::{borrow::Borrow, convert::TryFrom, fmt, str::FromStr};
+
 use zenoh_result::{bail, zerror, Error as ZError, ZResult};
+
+use super::{locator::*, parameters};
 
 // Parsing chars
 pub const PROTO_SEPARATOR: char = '/';
 pub const METADATA_SEPARATOR: char = '?';
-pub const LIST_SEPARATOR: char = ';';
-pub const FIELD_SEPARATOR: char = '=';
 pub const CONFIG_SEPARATOR: char = '#';
-pub const VALUE_SEPARATOR: char = '|';
-
-fn split_once(s: &str, c: char) -> (&str, &str) {
-    match s.find(c) {
-        Some(index) => {
-            let (l, r) = s.split_at(index);
-            (l, &r[1..])
-        }
-        None => (s, ""),
-    }
-}
 
 // Parsing functions
 pub(super) fn protocol(s: &str) -> &str {
@@ -64,84 +53,13 @@ pub(super) fn config(s: &str) -> &str {
     }
 }
 
-pub struct Parameters;
-
-impl Parameters {
-    pub fn extend<'s, I>(iter: I, into: &mut String)
-    where
-        I: Iterator<Item = (&'s str, &'s str)>,
-    {
-        let mut first = into.is_empty();
-        for (k, v) in iter {
-            if !first {
-                into.push(LIST_SEPARATOR);
-            }
-            into.push_str(k);
-            if !v.is_empty() {
-                into.push(FIELD_SEPARATOR);
-                into.push_str(v);
-            }
-            first = false;
-        }
-    }
-
-    pub fn iter(s: &str) -> impl Iterator<Item = (&str, &str)> + DoubleEndedIterator {
-        s.split(LIST_SEPARATOR).filter_map(|prop| {
-            if prop.is_empty() {
-                None
-            } else {
-                Some(split_once(prop, FIELD_SEPARATOR))
-            }
-        })
-    }
-
-    pub fn get<'s>(s: &'s str, k: &str) -> Option<&'s str> {
-        Self::iter(s).find(|x| x.0 == k).map(|x| x.1)
-    }
-
-    pub fn values<'s>(s: &'s str, k: &str) -> impl Iterator<Item = &'s str> + DoubleEndedIterator {
-        match Self::get(s, k) {
-            Some(v) => v.split(VALUE_SEPARATOR),
-            None => {
-                let mut i = "".split(VALUE_SEPARATOR);
-                i.next();
-                i
-            }
-        }
-    }
-
-    pub(super) fn insert<'s, I>(iter: I, k: &'s str, v: &'s str) -> String
-    where
-        I: Iterator<Item = (&'s str, &'s str)>,
-    {
-        let current = iter.filter(|x| x.0 != k);
-        let new = Some((k, v)).into_iter();
-        let iter = current.chain(new);
-
-        let mut into = String::new();
-        Parameters::extend(iter, &mut into);
-        into
-    }
-
-    pub(super) fn remove<'s, I>(iter: I, k: &'s str) -> String
-    where
-        I: Iterator<Item = (&'s str, &'s str)>,
-    {
-        let iter = iter.filter(|x| x.0 != k);
-
-        let mut into = String::new();
-        Parameters::extend(iter, &mut into);
-        into
-    }
-}
-
 // Protocol
 #[repr(transparent)]
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Protocol<'a>(pub(super) &'a str);
 
 impl<'a> Protocol<'a> {
-    pub fn as_str(&'a self) -> &'a str {
+    pub fn as_str(&self) -> &'a str {
         self.0
     }
 }
@@ -160,7 +78,7 @@ impl fmt::Display for Protocol<'_> {
 
 impl fmt::Debug for Protocol<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self)
+        write!(f, "{self}")
     }
 }
 
@@ -195,7 +113,7 @@ impl fmt::Display for ProtocolMut<'_> {
 
 impl fmt::Debug for ProtocolMut<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self)
+        write!(f, "{self}")
     }
 }
 
@@ -205,7 +123,7 @@ impl fmt::Debug for ProtocolMut<'_> {
 pub struct Address<'a>(pub(super) &'a str);
 
 impl<'a> Address<'a> {
-    pub fn as_str(&'a self) -> &'a str {
+    pub fn as_str(&self) -> &'a str {
         self.0
     }
 }
@@ -224,7 +142,13 @@ impl fmt::Display for Address<'_> {
 
 impl fmt::Debug for Address<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self)
+        write!(f, "{self}")
+    }
+}
+
+impl<'a> From<&'a str> for Address<'a> {
+    fn from(value: &'a str) -> Self {
+        Address(value)
     }
 }
 
@@ -259,7 +183,7 @@ impl fmt::Display for AddressMut<'_> {
 
 impl fmt::Debug for AddressMut<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self)
+        write!(f, "{self}")
     }
 }
 
@@ -269,7 +193,11 @@ impl fmt::Debug for AddressMut<'_> {
 pub struct Metadata<'a>(pub(super) &'a str);
 
 impl<'a> Metadata<'a> {
-    pub fn as_str(&'a self) -> &'a str {
+    pub const RELIABILITY: &'static str = "rel";
+    pub const PRIORITIES: &'static str = "prio";
+    pub const MULTISTREAM: &'static str = "multistream";
+
+    pub fn as_str(&self) -> &'a str {
         self.0
     }
 
@@ -277,16 +205,16 @@ impl<'a> Metadata<'a> {
         self.as_str().is_empty()
     }
 
-    pub fn iter(&'a self) -> impl Iterator<Item = (&'a str, &'a str)> + DoubleEndedIterator {
-        Parameters::iter(self.0)
+    pub fn iter(&'a self) -> impl DoubleEndedIterator<Item = (&'a str, &'a str)> + Clone {
+        parameters::iter(self.0)
     }
 
     pub fn get(&'a self, k: &str) -> Option<&'a str> {
-        Parameters::get(self.0, k)
+        parameters::get(self.0, k)
     }
 
-    pub fn values(&'a self, k: &str) -> impl Iterator<Item = &'a str> + DoubleEndedIterator {
-        Parameters::values(self.0, k)
+    pub fn values(&'a self, k: &str) -> impl DoubleEndedIterator<Item = &'a str> {
+        parameters::values(self.0, k)
     }
 }
 
@@ -304,7 +232,7 @@ impl fmt::Display for Metadata<'_> {
 
 impl fmt::Debug for Metadata<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self)
+        write!(f, "{self}")
     }
 }
 
@@ -323,25 +251,19 @@ impl<'a> MetadataMut<'a> {
 }
 
 impl MetadataMut<'_> {
-    pub fn extend<I, K, V>(&mut self, iter: I) -> ZResult<()>
+    pub fn extend_from_iter<'s, I, K, V>(&mut self, iter: I) -> ZResult<()>
     where
-        I: Iterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: AsRef<str>,
+        I: Iterator<Item = (&'s K, &'s V)> + Clone,
+        K: Borrow<str> + 's + ?Sized,
+        V: Borrow<str> + 's + ?Sized,
     {
-        for (k, v) in iter {
-            let k: &str = k.as_ref();
-            let v: &str = v.as_ref();
-            self.insert(k, v)?
-        }
-        Ok(())
-    }
-
-    pub fn insert(&mut self, k: &str, v: &str) -> ZResult<()> {
         let ep = EndPoint::new(
             self.0.protocol(),
             self.0.address(),
-            Parameters::insert(self.0.metadata().iter(), k, v),
+            parameters::from_iter(parameters::sort(parameters::join(
+                self.0.metadata().iter(),
+                iter.map(|(k, v)| (k.borrow(), v.borrow())),
+            ))),
             self.0.config(),
         )?;
 
@@ -349,11 +271,30 @@ impl MetadataMut<'_> {
         Ok(())
     }
 
-    pub fn remove(&mut self, k: &str) -> ZResult<()> {
+    pub fn insert<K, V>(&mut self, k: K, v: V) -> ZResult<()>
+    where
+        K: Borrow<str>,
+        V: Borrow<str>,
+    {
         let ep = EndPoint::new(
             self.0.protocol(),
             self.0.address(),
-            Parameters::remove(self.0.metadata().iter(), k),
+            parameters::insert_sort(self.0.metadata().as_str(), k.borrow(), v.borrow()).0,
+            self.0.config(),
+        )?;
+
+        self.0.inner = ep.inner;
+        Ok(())
+    }
+
+    pub fn remove<K>(&mut self, k: K) -> ZResult<()>
+    where
+        K: Borrow<str>,
+    {
+        let ep = EndPoint::new(
+            self.0.protocol(),
+            self.0.address(),
+            parameters::remove(self.0.metadata().as_str(), k.borrow()).0,
             self.0.config(),
         )?;
 
@@ -376,7 +317,7 @@ impl fmt::Display for MetadataMut<'_> {
 
 impl fmt::Debug for MetadataMut<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self)
+        write!(f, "{self}")
     }
 }
 
@@ -386,24 +327,24 @@ impl fmt::Debug for MetadataMut<'_> {
 pub struct Config<'a>(pub(super) &'a str);
 
 impl<'a> Config<'a> {
-    pub fn as_str(&'a self) -> &'a str {
+    pub fn as_str(&self) -> &'a str {
         self.0
     }
 
-    pub fn is_empty(&'a self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.as_str().is_empty()
     }
 
-    pub fn iter(&'a self) -> impl Iterator<Item = (&'a str, &'a str)> + DoubleEndedIterator {
-        Parameters::iter(self.0)
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (&'a str, &'a str)> + Clone {
+        parameters::iter(self.0)
     }
 
-    pub fn get(&'a self, k: &str) -> Option<&'a str> {
-        Parameters::get(self.0, k)
+    pub fn get(&self, k: &str) -> Option<&'a str> {
+        parameters::get(self.0, k)
     }
 
-    pub fn values(&'a self, k: &str) -> impl Iterator<Item = &'a str> + DoubleEndedIterator {
-        Parameters::values(self.0, k)
+    pub fn values(&self, k: &str) -> impl DoubleEndedIterator<Item = &'a str> {
+        parameters::values(self.0, k)
     }
 }
 
@@ -421,7 +362,7 @@ impl fmt::Display for Config<'_> {
 
 impl fmt::Debug for Config<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self)
+        write!(f, "{self}")
     }
 }
 
@@ -440,38 +381,51 @@ impl<'a> ConfigMut<'a> {
 }
 
 impl ConfigMut<'_> {
-    pub fn extend<I, K, V>(&mut self, iter: I) -> ZResult<()>
+    pub fn extend_from_iter<'s, I, K, V>(&mut self, iter: I) -> ZResult<()>
     where
-        I: Iterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: AsRef<str>,
+        I: Iterator<Item = (&'s K, &'s V)> + Clone,
+        K: Borrow<str> + 's + ?Sized,
+        V: Borrow<str> + 's + ?Sized,
     {
-        for (k, v) in iter {
-            let k: &str = k.as_ref();
-            let v: &str = v.as_ref();
-            self.insert(k, v)?
-        }
-        Ok(())
-    }
-
-    pub fn insert(&mut self, k: &str, v: &str) -> ZResult<()> {
         let ep = EndPoint::new(
             self.0.protocol(),
             self.0.address(),
             self.0.metadata(),
-            Parameters::insert(self.0.config().iter(), k, v),
+            parameters::from_iter(parameters::sort(parameters::join(
+                self.0.config().iter(),
+                iter.map(|(k, v)| (k.borrow(), v.borrow())),
+            ))),
         )?;
 
         self.0.inner = ep.inner;
         Ok(())
     }
 
-    pub fn remove(&mut self, k: &str) -> ZResult<()> {
+    pub fn insert<K, V>(&mut self, k: K, v: V) -> ZResult<()>
+    where
+        K: Borrow<str>,
+        V: Borrow<str>,
+    {
         let ep = EndPoint::new(
             self.0.protocol(),
             self.0.address(),
             self.0.metadata(),
-            Parameters::remove(self.0.config().iter(), k),
+            parameters::insert_sort(self.0.config().as_str(), k.borrow(), v.borrow()).0,
+        )?;
+
+        self.0.inner = ep.inner;
+        Ok(())
+    }
+
+    pub fn remove<K>(&mut self, k: K) -> ZResult<()>
+    where
+        K: Borrow<str>,
+    {
+        let ep = EndPoint::new(
+            self.0.protocol(),
+            self.0.address(),
+            self.0.metadata(),
+            parameters::remove(self.0.config().as_str(), k.borrow()).0,
         )?;
 
         self.0.inner = ep.inner;
@@ -493,11 +447,36 @@ impl fmt::Display for ConfigMut<'_> {
 
 impl fmt::Debug for ConfigMut<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self)
+        write!(f, "{self}")
     }
 }
 
-/// A `String` that respects the [`EndPoint`] canon form: `<locator>#<config>`, such that `<locator>` is a valid [`Locator`] `<config>` is of the form `<key1>=<value1>;...;<keyN>=<valueN>` where keys are alphabetically sorted.
+/// A string that respects the [`EndPoint`] canon form: `<locator>[#<config>]`.
+///
+/// `<locator>` is a valid [`Locator`] and `<config>` is of the form
+/// `<key1>=<value1>;...;<keyN>=<valueN>` where keys are alphabetically sorted. `<config>` is
+/// optional and can be provided to configure some aspects for an [`EndPoint`], e.g. the interface
+/// to listen on or connect to.
+///
+/// A full [`EndPoint`] string is hence in the form of `<proto>/<address>[?<metadata>][#config]`.
+///
+/// ## Metadata
+///
+/// - **`prio`**: a priority range bounded inclusively below and above (e.g. `2-4` signifies
+///   priorities 2, 3 and 4). This value is used to select the link used for transmission based on
+///   the Priority of the message in question.
+///
+///   For example, `tcp/localhost:7447?prio=1-3` assigns priorities
+///   [`Priority::RealTime`](crate::core::Priority::RealTime), [Priority::InteractiveHigh](crate::core::Priority::InteractiveHigh) and
+///   [`Priority::InteractiveLow`](crate::core::Priority::InteractiveLow) to the established link.
+///
+/// - **`rel`**: either "0" for [`Reliability::BestEffort`](crate::core::Reliability::BestEffort) or "1" for
+///   [`Reliability::Reliable`](crate::core::Reliability::Reliable). This value is used to select the link used for
+///   transmission based on the reliability of the message in question.
+///
+///   For example, `tcp/localhost:7447?prio=6-7;rel=0` assigns priorities
+///   [`Priority::DataLow`](crate::core::Priority::DataLow) and [Priority::Background](crate::core::Priority::Background), and
+///   [`Reliability::BestEffort`](crate::core::Reliability::BestEffort) to the established link.
 #[derive(Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(into = "String")]
 #[serde(try_from = "String")]
@@ -518,7 +497,7 @@ impl EndPoint {
         let m: &str = metadata.as_ref();
         let c: &str = config.as_ref();
 
-        let len = p.as_bytes().len() + a.as_bytes().len() + m.as_bytes().len();
+        let len = p.len() + a.len() + m.len();
         if len > u8::MAX as usize {
             bail!("Endpoint too big: {} bytes. Max: {} bytes. ", len, u8::MAX);
         }
@@ -539,7 +518,7 @@ impl EndPoint {
         self.inner.as_str()
     }
 
-    pub fn split(&self) -> (Protocol, Address, Metadata, Config) {
+    pub fn split(&self) -> (Protocol<'_>, Address<'_>, Metadata<'_>, Config<'_>) {
         (
             self.protocol(),
             self.address(),
@@ -548,40 +527,48 @@ impl EndPoint {
         )
     }
 
-    pub fn protocol(&self) -> Protocol {
+    pub fn protocol(&self) -> Protocol<'_> {
         Protocol(protocol(self.inner.as_str()))
     }
 
-    pub fn protocol_mut(&mut self) -> ProtocolMut {
+    pub fn protocol_mut(&mut self) -> ProtocolMut<'_> {
         ProtocolMut(self)
     }
 
-    pub fn address(&self) -> Address {
+    pub fn address(&self) -> Address<'_> {
         Address(address(self.inner.as_str()))
     }
 
-    pub fn address_mut(&mut self) -> AddressMut {
+    pub fn address_mut(&mut self) -> AddressMut<'_> {
         AddressMut(self)
     }
 
-    pub fn metadata(&self) -> Metadata {
+    pub fn metadata(&self) -> Metadata<'_> {
         Metadata(metadata(self.inner.as_str()))
     }
 
-    pub fn metadata_mut(&mut self) -> MetadataMut {
+    pub fn metadata_mut(&mut self) -> MetadataMut<'_> {
         MetadataMut(self)
     }
 
-    pub fn config(&self) -> Config {
+    pub fn config(&self) -> Config<'_> {
         Config(config(self.inner.as_str()))
     }
 
-    pub fn config_mut(&mut self) -> ConfigMut {
+    pub fn config_mut(&mut self) -> ConfigMut<'_> {
         ConfigMut(self)
     }
 
     pub fn to_locator(&self) -> Locator {
         self.clone().into()
+    }
+
+    /// Constructs an uninitialized empty EndPoint.
+    #[zenoh_macros::internal]
+    pub fn empty() -> Self {
+        EndPoint {
+            inner: String::default(),
+        }
     }
 }
 
@@ -599,7 +586,7 @@ impl fmt::Display for EndPoint {
 
 impl fmt::Debug for EndPoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self)
+        write!(f, "{self}")
     }
 }
 
@@ -616,27 +603,6 @@ impl TryFrom<String> for EndPoint {
         const ERR: &str =
             "Endpoints must be of the form <protocol>/<address>[?<metadata>][#<config>]";
 
-        fn sort_hashmap(from: &str, into: &mut String) {
-            let mut from = from
-                .split(LIST_SEPARATOR)
-                .map(|p| split_once(p, FIELD_SEPARATOR))
-                .collect::<Vec<(&str, &str)>>();
-            from.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
-
-            let mut first = true;
-            for (k, v) in from.iter() {
-                if !first {
-                    into.push(LIST_SEPARATOR);
-                }
-                into.push_str(k);
-                if !v.is_empty() {
-                    into.push(FIELD_SEPARATOR);
-                    into.push_str(v);
-                }
-                first = false;
-            }
-        }
-
         let pidx = s
             .find(PROTO_SEPARATOR)
             .and_then(|i| (!s[..i].is_empty() && !s[i + 1..].is_empty()).then_some(i))
@@ -649,14 +615,20 @@ impl TryFrom<String> for EndPoint {
             (Some(midx), None) if midx > pidx && !s[midx + 1..].is_empty() => {
                 let mut inner = String::with_capacity(s.len());
                 inner.push_str(&s[..midx + 1]); // Includes metadata separator
-                sort_hashmap(&s[midx + 1..], &mut inner);
+                parameters::from_iter_into(
+                    parameters::sort(parameters::iter(&s[midx + 1..])),
+                    &mut inner,
+                );
                 Ok(EndPoint { inner })
             }
             // There is some config
             (None, Some(cidx)) if cidx > pidx && !s[cidx + 1..].is_empty() => {
                 let mut inner = String::with_capacity(s.len());
                 inner.push_str(&s[..cidx + 1]); // Includes config separator
-                sort_hashmap(&s[cidx + 1..], &mut inner);
+                parameters::from_iter_into(
+                    parameters::sort(parameters::iter(&s[cidx + 1..])),
+                    &mut inner,
+                );
                 Ok(EndPoint { inner })
             }
             // There is some metadata and some config
@@ -669,10 +641,16 @@ impl TryFrom<String> for EndPoint {
                 let mut inner = String::with_capacity(s.len());
                 inner.push_str(&s[..midx + 1]); // Includes metadata separator
 
-                sort_hashmap(&s[midx + 1..cidx], &mut inner);
+                parameters::from_iter_into(
+                    parameters::sort(parameters::iter(&s[midx + 1..cidx])),
+                    &mut inner,
+                );
 
                 inner.push(CONFIG_SEPARATOR);
-                sort_hashmap(&s[cidx + 1..], &mut inner);
+                parameters::from_iter_into(
+                    parameters::sort(parameters::iter(&s[cidx + 1..])),
+                    &mut inner,
+                );
 
                 Ok(EndPoint { inner })
             }
@@ -691,33 +669,15 @@ impl FromStr for EndPoint {
 
 impl EndPoint {
     #[cfg(feature = "test")]
+    #[doc(hidden)]
     pub fn rand() -> Self {
         use rand::{
             distributions::{Alphanumeric, DistString},
-            rngs::ThreadRng,
             Rng,
         };
 
         const MIN: usize = 2;
         const MAX: usize = 8;
-
-        fn gen_hashmap(rng: &mut ThreadRng, endpoint: &mut String) {
-            let num = rng.gen_range(MIN..MAX);
-            for i in 0..num {
-                if i != 0 {
-                    endpoint.push(LIST_SEPARATOR);
-                }
-                let len = rng.gen_range(MIN..MAX);
-                let key = Alphanumeric.sample_string(rng, len);
-                endpoint.push_str(key.as_str());
-
-                endpoint.push(FIELD_SEPARATOR);
-
-                let len = rng.gen_range(MIN..MAX);
-                let value = Alphanumeric.sample_string(rng, len);
-                endpoint.push_str(value.as_str());
-            }
-        }
 
         let mut rng = rand::thread_rng();
         let mut endpoint = String::new();
@@ -734,11 +694,11 @@ impl EndPoint {
 
         if rng.gen_bool(0.5) {
             endpoint.push(METADATA_SEPARATOR);
-            gen_hashmap(&mut rng, &mut endpoint);
+            parameters::rand(&mut endpoint);
         }
         if rng.gen_bool(0.5) {
             endpoint.push(CONFIG_SEPARATOR);
-            gen_hashmap(&mut rng, &mut endpoint);
+            parameters::rand(&mut endpoint);
         }
 
         endpoint.parse().unwrap()
@@ -910,14 +870,14 @@ fn endpoints() {
     let mut endpoint = EndPoint::from_str("udp/127.0.0.1:7447").unwrap();
     endpoint
         .metadata_mut()
-        .extend([("a", "1"), ("c", "3"), ("b", "2")].iter().copied())
+        .extend_from_iter([("a", "1"), ("c", "3"), ("b", "2")].iter().copied())
         .unwrap();
     assert_eq!(endpoint.as_str(), "udp/127.0.0.1:7447?a=1;b=2;c=3");
 
     let mut endpoint = EndPoint::from_str("udp/127.0.0.1:7447").unwrap();
     endpoint
         .config_mut()
-        .extend([("A", "1"), ("C", "3"), ("B", "2")].iter().copied())
+        .extend_from_iter([("A", "1"), ("C", "3"), ("B", "2")].iter().copied())
         .unwrap();
     assert_eq!(endpoint.as_str(), "udp/127.0.0.1:7447#A=1;B=2;C=3");
 

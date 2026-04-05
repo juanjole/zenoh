@@ -65,7 +65,7 @@ pub(crate) fn recursive_include<P>(
 where
     P: AsRef<Path>,
 {
-    // if include property is present, read the file and remove properites found in file from values
+    // if include property is present, read the file and remove properties found in file from values
     let include_object = if let Some(include_path) = values.get(include_property_name) {
         let Some(include_path) = include_path.as_str() else {
             bail!(
@@ -136,10 +136,7 @@ where
 
             values.remove(k);
             if let Some(include_values) = v.as_object_mut() {
-                let title = format!(
-                    "{}.{} -> {}::{}",
-                    title, include_property_name, include_path, k
-                );
+                let title = format!("{title}.{include_property_name} -> {include_path}::{k}");
                 recursive_include(
                     title.as_str(),
                     include_values,
@@ -157,7 +154,7 @@ where
     // process remaining object values
     for (k, v) in values.iter_mut() {
         if let Some(object) = v.as_object_mut() {
-            let title = format!("{}.{}", title, k);
+            let title = format!("{title}.{k}");
             recursive_include(
                 title.as_str(),
                 object,
@@ -168,7 +165,7 @@ where
         }
     }
 
-    // if external file was incluided, add it's content to values
+    // if external file was included, add it's content to values
     if let Some(mut include_values) = include_object {
         values.append(include_values.as_object_mut().unwrap());
     }

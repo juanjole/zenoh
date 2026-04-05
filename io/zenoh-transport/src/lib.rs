@@ -16,28 +16,29 @@
 //!
 //! This crate is intended for Zenoh's internal use.
 //!
-//! [Click here for Zenoh's documentation](../zenoh/index.html)
+//! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
 pub mod common;
 pub mod manager;
 pub mod multicast;
-pub mod primitives;
 pub mod unicast;
 
-#[cfg(feature = "stats")]
-pub use common::stats;
-
 #[cfg(feature = "shared-memory")]
-mod shm;
+pub mod shm;
+#[cfg(feature = "shared-memory")]
+mod shm_context;
 
-use crate::{multicast::TransportMulticast, unicast::TransportUnicast};
+use std::{any::Any, sync::Arc};
+
 pub use manager::*;
 use serde::Serialize;
-use std::any::Any;
-use std::sync::Arc;
 use zenoh_link::Link;
-use zenoh_protocol::core::{WhatAmI, ZenohId};
-use zenoh_protocol::network::NetworkMessage;
+use zenoh_protocol::{
+    core::{RegionName, WhatAmI, ZenohIdProto},
+    network::NetworkMessageMut,
+};
 use zenoh_result::ZResult;
+
+use crate::{multicast::TransportMulticast, unicast::TransportUnicast};
 
 /*************************************/
 /*            TRANSPORT              */
@@ -80,7 +81,6 @@ impl TransportEventHandler for DummyTransportEventHandler {
 /*************************************/
 pub trait TransportMulticastEventHandler: Send + Sync {
     fn new_peer(&self, peer: TransportPeer) -> ZResult<Arc<dyn TransportPeerEventHandler>>;
-    fn closing(&self);
     fn closed(&self);
     fn as_any(&self) -> &dyn Any;
 }
@@ -93,7 +93,6 @@ impl TransportMulticastEventHandler for DummyTransportMulticastEventHandler {
     fn new_peer(&self, _peer: TransportPeer) -> ZResult<Arc<dyn TransportPeerEventHandler>> {
         Ok(Arc::new(DummyTransportPeerEventHandler))
     }
-    fn closing(&self) {}
     fn closed(&self) {}
     fn as_any(&self) -> &dyn Any {
         self
@@ -106,20 +105,20 @@ impl TransportMulticastEventHandler for DummyTransportMulticastEventHandler {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename = "Transport")]
 pub struct TransportPeer {
-    pub zid: ZenohId,
+    pub zid: ZenohIdProto,
     pub whatami: WhatAmI,
     pub is_qos: bool,
     #[serde(skip)]
     pub links: Vec<Link>,
     #[cfg(feature = "shared-memory")]
     pub is_shm: bool,
+    pub region_name: Option<RegionName>,
 }
 
 pub trait TransportPeerEventHandler: Send + Sync {
-    fn handle_message(&self, msg: NetworkMessage) -> ZResult<()>;
+    fn handle_message(&self, msg: NetworkMessageMut) -> ZResult<()>;
     fn new_link(&self, src: Link);
     fn del_link(&self, link: Link);
-    fn closing(&self);
     fn closed(&self);
     fn as_any(&self) -> &dyn Any;
 }
@@ -129,13 +128,12 @@ pub trait TransportPeerEventHandler: Send + Sync {
 pub struct DummyTransportPeerEventHandler;
 
 impl TransportPeerEventHandler for DummyTransportPeerEventHandler {
-    fn handle_message(&self, _message: NetworkMessage) -> ZResult<()> {
+    fn handle_message(&self, _message: NetworkMessageMut) -> ZResult<()> {
         Ok(())
     }
 
     fn new_link(&self, _link: Link) {}
     fn del_link(&self, _link: Link) {}
-    fn closing(&self) {}
     fn closed(&self) {}
 
     fn as_any(&self) -> &dyn Any {

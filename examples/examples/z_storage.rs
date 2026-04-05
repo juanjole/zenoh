@@ -13,70 +13,59 @@
 //
 #![recursion_limit = "256"]
 
-use async_std::task::sleep;
-use clap::Parser;
-use futures::prelude::*;
-use futures::select;
 use std::collections::HashMap;
-use std::time::Duration;
-use zenoh::config::Config;
-use zenoh::prelude::r#async::*;
+
+use clap::Parser;
+use futures::select;
+use zenoh::{
+    key_expr::{keyexpr, KeyExpr},
+    sample::{Sample, SampleKind},
+    Config,
+};
 use zenoh_examples::CommonArgs;
 
-#[async_std::main]
+#[tokio::main]
 async fn main() {
     // initiate logging
-    env_logger::init();
+    zenoh::init_log_from_env_or("error");
 
     let (config, key_expr, complete) = parse_args();
 
     let mut stored: HashMap<String, Sample> = HashMap::new();
 
     println!("Opening session...");
-    let session = zenoh::open(config).res().await.unwrap();
+    let session = zenoh::open(config).await.unwrap();
 
     println!("Declaring Subscriber on '{key_expr}'...");
-    let subscriber = session.declare_subscriber(&key_expr).res().await.unwrap();
+    let subscriber = session.declare_subscriber(&key_expr).await.unwrap();
 
     println!("Declaring Queryable on '{key_expr}'...");
     let queryable = session
         .declare_queryable(&key_expr)
         .complete(complete)
-        .res()
         .await
         .unwrap();
 
-    println!("Enter 'q' to quit...");
-    let mut stdin = async_std::io::stdin();
-    let mut input = [0u8];
+    println!("Press CTRL-C to quit...");
     loop {
         select!(
             sample = subscriber.recv_async() => {
                 let sample = sample.unwrap();
-                println!(">> [Subscriber] Received {} ('{}': '{}')",
-                    sample.kind, sample.key_expr.as_str(), sample.value);
-                if sample.kind == SampleKind::Delete {
-                    stored.remove(&sample.key_expr.to_string());
-                } else {
-                    stored.insert(sample.key_expr.to_string(), sample);
-                }
+                let payload = sample.payload().try_to_string().unwrap_or_else(|e| e.to_string().into());
+                println!(">> [Subscriber] Received {} ('{}': '{}')", sample.kind(), sample.key_expr().as_str(),payload);
+                match sample.kind() {
+                    SampleKind::Delete => stored.remove(&sample.key_expr().to_string()),
+                    SampleKind::Put => stored.insert(sample.key_expr().to_string(), sample),
+                };
             },
 
             query = queryable.recv_async() => {
                 let query = query.unwrap();
                 println!(">> [Queryable ] Received Query '{}'", query.selector());
                 for (stored_name, sample) in stored.iter() {
-                    if query.selector().key_expr.intersects(unsafe {keyexpr::from_str_unchecked(stored_name)}) {
-                        query.reply(Ok(sample.clone())).res().await.unwrap();
+                    if query.key_expr().intersects(unsafe {keyexpr::from_str_unchecked(stored_name)}) {
+                        query.reply(sample.key_expr().clone(), sample.payload().clone()).await.unwrap();
                     }
-                }
-            },
-
-            _ = stdin.read_exact(&mut input).fuse() => {
-                match input[0] {
-                    b'q' => break,
-                    0 => sleep(Duration::from_secs(1)).await,
-                    _ => (),
                 }
             }
         );

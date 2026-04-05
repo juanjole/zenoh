@@ -12,22 +12,42 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use alloc::string::String;
-use const_format::formatcp;
 use core::{convert::TryFrom, fmt, num::NonZeroU8, ops::BitOr, str::FromStr};
+
+use const_format::formatcp;
+use serde::ser::SerializeSeq;
 use zenoh_result::{bail, ZError};
 
+/// The type of the node in the Zenoh network.
+///
+/// The zenoh application can work in three different modes: router, peer, and client.
+///
+/// In the peer mode the application searches for other nodes and establishes direct connections
+/// with them. This can work using multicast discovery and by getting gossip information
+/// from the initial entry points. The peer mode is the default mode.
+///
+/// In the client mode the application remains connected to a single connection point, which
+/// serves as a gateway to the rest of the network. This mode is useful for constrained
+/// devices that cannot afford to maintain multiple connections.
+///
+/// The router mode is used to run a zenoh router, which is a node that
+/// maintains a predefined zenoh network topology. Unlike peers, routers do not
+/// discover other nodes by themselves, but rely on static configuration.
+///
+/// A more detailed explanation of each mode is at [Zenoh Documentation](https://zenoh.io/docs/getting-started/deployment/)
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum WhatAmI {
     Router = 0b001,
+    #[default]
     Peer = 0b010,
     Client = 0b100,
 }
 
 impl WhatAmI {
-    const STR_R: &str = "router";
-    const STR_P: &str = "peer";
-    const STR_C: &str = "client";
+    const STR_R: &'static str = "router";
+    const STR_P: &'static str = "peer";
+    const STR_C: &'static str = "client";
 
     const U8_R: u8 = Self::Router as u8;
     const U8_P: u8 = Self::Peer as u8;
@@ -42,6 +62,7 @@ impl WhatAmI {
     }
 
     #[cfg(feature = "test")]
+    #[doc(hidden)]
     pub fn rand() -> Self {
         use rand::prelude::SliceRandom;
         let mut rng = rand::thread_rng();
@@ -49,6 +70,18 @@ impl WhatAmI {
         *[Self::Router, Self::Peer, Self::Client]
             .choose(&mut rng)
             .unwrap()
+    }
+
+    pub const fn is_client(self) -> bool {
+        matches!(self, WhatAmI::Client)
+    }
+
+    pub const fn is_peer(self) -> bool {
+        matches!(self, WhatAmI::Peer)
+    }
+
+    pub const fn is_router(self) -> bool {
+        matches!(self, WhatAmI::Router)
     }
 }
 
@@ -95,6 +128,11 @@ impl From<WhatAmI> for u8 {
     }
 }
 
+/// A helper type that allows matching combinations of `WhatAmI` values in scouting.
+///
+/// The [`scout`](crate::scouting::scout) function accepts a `WhatAmIMatcher` to filter the nodes
+/// of the specified types. The `WhatAmIMatcher` can be constructed from [`WhatAmI`] values
+/// with the `|` operator
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WhatAmIMatcher(NonZeroU8);
@@ -110,30 +148,38 @@ impl WhatAmIMatcher {
     const U8_R_C: u8 = Self::U8_0 | WhatAmI::U8_R | WhatAmI::U8_C;
     const U8_R_P_C: u8 = Self::U8_0 | WhatAmI::U8_R | WhatAmI::U8_P | WhatAmI::U8_C;
 
+    /// Creates an empty `WhatAmIMatcher`, which matches no `WhatAmI` values.
     pub const fn empty() -> Self {
         Self(unsafe { NonZeroU8::new_unchecked(Self::U8_0) })
     }
 
+    /// Creates a `WhatAmIMatcher` matching all [`WhatAmI::Router`] values.
     pub const fn router(self) -> Self {
         Self(unsafe { NonZeroU8::new_unchecked(self.0.get() | Self::U8_R) })
     }
 
+    /// Creates a `WhatAmIMatcher` matching all [`WhatAmI::Peer`] values.
     pub const fn peer(self) -> Self {
         Self(unsafe { NonZeroU8::new_unchecked(self.0.get() | Self::U8_P) })
     }
 
+    /// Creates a `WhatAmIMatcher` matching all [`WhatAmI::Client`] values.
     pub const fn client(self) -> Self {
         Self(unsafe { NonZeroU8::new_unchecked(self.0.get() | Self::U8_C) })
     }
 
+    /// Returns whether the `WhatAmIMatcher` is empty.
     pub const fn is_empty(&self) -> bool {
         self.0.get() == Self::U8_0
     }
 
+    /// Returns whether the `WhatAmIMatcher` matches the given `WhatAmI` value.
     pub const fn matches(&self, w: WhatAmI) -> bool {
         (self.0.get() & w as u8) != 0
     }
 
+    /// Returns a string representation of the `WhatAmIMatcher` as a combination of
+    /// `WhatAmI` string representations separated by `|`.
     pub const fn to_str(self) -> &'static str {
         match self.0.get() {
             Self::U8_0 => "",
@@ -144,11 +190,13 @@ impl WhatAmIMatcher {
             Self::U8_R_C => formatcp!("{}|{}", WhatAmI::STR_R, WhatAmI::STR_C),
             Self::U8_P_C => formatcp!("{}|{}", WhatAmI::STR_P, WhatAmI::STR_C),
             Self::U8_R_P_C => formatcp!("{}|{}|{}", WhatAmI::STR_R, WhatAmI::STR_P, WhatAmI::STR_C),
+
             _ => unreachable!(),
         }
     }
 
     #[cfg(feature = "test")]
+    #[doc(hidden)]
     pub fn rand() -> Self {
         use rand::Rng;
 
@@ -317,7 +365,14 @@ impl serde::Serialize for WhatAmIMatcher {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(self.to_str())
+        let values = [WhatAmI::Router, WhatAmI::Peer, WhatAmI::Client]
+            .iter()
+            .filter(|v| self.matches(**v));
+        let mut seq = serializer.serialize_seq(Some(values.clone().count()))?;
+        for v in values {
+            seq.serialize_element(v)?;
+        }
+        seq.end()
     }
 }
 
@@ -327,41 +382,40 @@ impl<'de> serde::de::Visitor<'de> for WhatAmIMatcherVisitor {
     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         write!(
             formatter,
-            "a | separated list of whatami variants ('{}', '{}', '{}')",
+            "a list of whatami variants ('{}', '{}', '{}')",
             WhatAmI::STR_R,
             WhatAmI::STR_P,
             WhatAmI::STR_C
         )
     }
 
-    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
     where
-        E: serde::de::Error,
+        A: serde::de::SeqAccess<'de>,
     {
-        v.parse().map_err(|_| {
-            serde::de::Error::invalid_value(
-                serde::de::Unexpected::Str(v),
-                &formatcp!(
-                    "a | separated list of whatami variants ('{}', '{}', '{}')",
-                    WhatAmI::STR_R,
-                    WhatAmI::STR_P,
-                    WhatAmI::STR_C
-                ),
-            )
-        })
-    }
+        let mut inner = 0;
 
-    fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        self.visit_str(v)
-    }
-    fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        self.visit_str(&v)
+        while let Some(s) = seq.next_element::<String>()? {
+            match s.as_str() {
+                WhatAmI::STR_R => inner |= WhatAmI::U8_R,
+                WhatAmI::STR_P => inner |= WhatAmI::U8_P,
+                WhatAmI::STR_C => inner |= WhatAmI::U8_C,
+                _ => {
+                    return Err(serde::de::Error::invalid_value(
+                        serde::de::Unexpected::Str(&s),
+                        &formatcp!(
+                            "one of ('{}', '{}', '{}')",
+                            WhatAmI::STR_R,
+                            WhatAmI::STR_P,
+                            WhatAmI::STR_C
+                        ),
+                    ))
+                }
+            }
+        }
+
+        Ok(WhatAmIMatcher::try_from(inner)
+            .expect("`WhatAmIMatcher` should be valid by construction"))
     }
 }
 
@@ -370,6 +424,6 @@ impl<'de> serde::Deserialize<'de> for WhatAmIMatcher {
     where
         D: serde::Deserializer<'de>,
     {
-        deserializer.deserialize_str(WhatAmIMatcherVisitor)
+        deserializer.deserialize_seq(WhatAmIMatcherVisitor)
     }
 }

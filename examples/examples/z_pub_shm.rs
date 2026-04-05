@@ -11,96 +11,62 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use async_std::task::sleep;
 use clap::Parser;
-use std::time::Duration;
-use zenoh::config::Config;
-use zenoh::prelude::r#async::*;
-use zenoh::shm::SharedMemoryManager;
+use zenoh::{
+    key_expr::KeyExpr,
+    shm::{BlockOn, GarbageCollect, ShmProviderBuilder},
+    Config, Wait,
+};
 use zenoh_examples::CommonArgs;
 
-const N: usize = 10;
-const K: u32 = 3;
-
-#[async_std::main]
-async fn main() -> Result<(), zenoh::Error> {
+#[tokio::main]
+async fn main() -> zenoh::Result<()> {
     // Initiate logging
-    env_logger::init();
+    zenoh::init_log_from_env_or("error");
 
-    let (mut config, path, value) = parse_args();
-
-    // A probing procedure for shared memory is performed upon session opening. To enable `z_pub_shm` to operate
-    // over shared memory (and to not fallback on network mode), shared memory needs to be enabled also on the
-    // subscriber side. By doing so, the probing procedure will succeed and shared memory will operate as expected.
-    config.transport.shared_memory.set_enabled(true).unwrap();
+    let (config, path, payload) = parse_args();
 
     println!("Opening session...");
-    let session = zenoh::open(config).res().await.unwrap();
+    let session = zenoh::open(config).await.unwrap();
 
-    println!("Creating Shared Memory Manager...");
-    let id = session.zid();
-    let mut shm = SharedMemoryManager::make(id.to_string(), N * 1024).unwrap();
+    println!("Creating POSIX SHM provider...");
+    // Create SHM provider with default backend
+    // NOTE: For extended PosixShmProviderBackend API please check z_posix_shm_provider.rs
+    let provider = ShmProviderBuilder::default_backend(1024 * 1024)
+        .wait()
+        .unwrap();
 
-    println!("Allocating Shared Memory Buffer...");
-    let publisher = session.declare_publisher(&path).res().await.unwrap();
+    println!("Declaring Publisher on '{path}'...");
+    let publisher = session.declare_publisher(&path).await.unwrap();
 
-    for idx in 0..(K * N as u32) {
-        sleep(Duration::from_secs(1)).await;
-        let mut sbuf = match shm.alloc(1024) {
-            Ok(buf) => buf,
-            Err(_) => {
-                sleep(Duration::from_millis(100)).await;
-                println!(
-                    "Afer failing allocation the GC collected: {} bytes -- retrying",
-                    shm.garbage_collect()
-                );
-                println!(
-                    "Trying to de-fragment memory... De-fragmented {} bytes",
-                    shm.defragment()
-                );
-                shm.alloc(1024).unwrap()
-            }
-        };
+    println!("Press CTRL-C to quit...");
+    for idx in 0..u32::MAX {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
         // We reserve a small space at the beginning of the buffer to include the iteration index
         // of the write. This is simply to have the same format as zn_pub.
         let prefix = format!("[{idx:4}] ");
-        let prefix_len = prefix.as_bytes().len();
+        let prefix_len = prefix.len();
+        let slice_len = prefix_len + payload.len();
 
-        // Retrive a mutable slice from the SharedMemoryBuf.
-        //
-        // This operation is marked unsafe since we cannot guarantee a single mutable reference
-        // across multiple processes. Thus if you use it, and you'll inevitable have to use it,
-        // you have to keep in mind that if you have multiple process retrieving a mutable slice
-        // you may get into concurrent writes. That said, if you have a serial pipeline and
-        // the buffer is flowing through the pipeline this will not create any issues.
-        //
-        // In short, whilst this operation is marked as unsafe, you are safe if you can
-        // guarantee that in your application only one process at the time will actually write.
-        let slice = unsafe { sbuf.as_mut_slice() };
-        let slice_len = prefix_len + value.as_bytes().len();
-        slice[0..prefix_len].copy_from_slice(prefix.as_bytes());
-        slice[prefix_len..slice_len].copy_from_slice(value.as_bytes());
+        // Allocate SHM buffer
+        let mut sbuf = provider
+            .alloc(slice_len)
+            .with_policy::<BlockOn<GarbageCollect>>()
+            .await
+            .unwrap();
+
+        sbuf[0..prefix_len].copy_from_slice(prefix.as_bytes());
+        sbuf[prefix_len..slice_len].copy_from_slice(payload.as_bytes());
 
         // Write the data
         println!(
             "Put SHM Data ('{}': '{}')",
             path,
-            String::from_utf8_lossy(&slice[0..slice_len])
+            String::from_utf8_lossy(&sbuf[0..slice_len])
         );
-        publisher.put(sbuf.clone()).res().await?;
-        if idx % K == 0 {
-            let freed = shm.garbage_collect();
-            println!("The Gargabe collector freed {freed} bytes");
-            let defrag = shm.defragment();
-            println!("De-framented {defrag} bytes");
-        }
-        // Dropping the SharedMemoryBuf means to free it.
-        drop(sbuf);
+        publisher.put(sbuf).await?;
     }
-
-    // Signal the SharedMemoryManager to garbage collect all the freed SharedMemoryBuf.
-    let _freed = shm.garbage_collect();
 
     Ok(())
 }
@@ -109,15 +75,15 @@ async fn main() -> Result<(), zenoh::Error> {
 struct Args {
     #[arg(short, long, default_value = "demo/example/zenoh-rs-pub")]
     /// The key expression to publish onto.
-    path: KeyExpr<'static>,
-    #[arg(short, long, default_value = "Pub from SharedMemory Rust!")]
-    /// The value of to publish.
-    value: String,
+    key: KeyExpr<'static>,
+    #[arg(short, long, default_value = "Pub from Rust SHM!")]
+    /// The payload of to publish.
+    payload: String,
     #[command(flatten)]
     common: CommonArgs,
 }
 
 fn parse_args() -> (Config, KeyExpr<'static>, String) {
     let args = Args::parse();
-    (args.common.into(), args.path, args.value)
+    (args.common.into(), args.key, args.payload)
 }

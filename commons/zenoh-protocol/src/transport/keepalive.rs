@@ -12,6 +12,12 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
+pub mod flag {
+    // pub const X: u8 = 1 << 5; // 0x20       Reserved
+    // pub const X: u8 = 1 << 6; // 0x40       Reserved
+    pub const Z: u8 = 1 << 7; // 0x80 Extensions    if Z==1 then an extension will follow
+}
+
 /// # KeepAlive message
 ///
 /// The [`KeepAlive`] message SHOULD be sent periodically to avoid the expiration of the
@@ -49,7 +55,7 @@
 ///
 /// NOTE: In order to consider eventual packet loss, transmission latency and jitter, the time
 ///       interval between two subsequent [`KeepAlive`] messages SHOULD be set to one fourth of
-///       the lease time. This is in-line with the ITU-T G.8013/Y.1731 specification on continous
+///       the lease time. This is in-line with the ITU-T G.8013/Y.1731 specification on continuous
 ///       connectivity check which considers a link as failed when no messages are received in
 ///       3.5 times the target keep alive interval.
 ///
@@ -75,17 +81,12 @@
 ///       the boundary of the serialized messages. The length is encoded as little-endian.
 ///       In any case, the length of a message must not exceed 65535 bytes.
 ///
-pub mod flag {
-    // pub const X: u8 = 1 << 5; // 0x20       Reserved
-    // pub const X: u8 = 1 << 6; // 0x40       Reserved
-    pub const Z: u8 = 1 << 7; // 0x80 Extensions    if Z==1 then an extension will follow
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeepAlive;
 
 impl KeepAlive {
     #[cfg(feature = "test")]
+    #[doc(hidden)]
     pub fn rand() -> Self {
         Self
     }

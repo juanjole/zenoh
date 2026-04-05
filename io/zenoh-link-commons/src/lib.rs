@@ -16,44 +16,66 @@
 //!
 //! This crate is intended for Zenoh's internal use.
 //!
-//! [Click here for Zenoh's documentation](../zenoh/index.html)
-#![no_std]
+//! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
 extern crate alloc;
 
+mod dscp;
+mod listener;
 mod multicast;
+#[cfg(feature = "quic")]
+pub mod quic;
+pub mod tcp;
+#[cfg(feature = "tls")]
+pub mod tls;
 mod unicast;
 
-use alloc::{borrow::ToOwned, boxed::Box, string::String};
-use async_trait::async_trait;
+use alloc::{borrow::ToOwned, boxed::Box, string::String, vec, vec::Vec};
 use core::{cmp::PartialEq, fmt, hash::Hash};
+
+use async_trait::async_trait;
+pub use dscp::*;
+pub use listener::*;
 pub use multicast::*;
 use serde::Serialize;
 pub use unicast::*;
-use zenoh_protocol::core::Locator;
+use zenoh_protocol::{
+    core::{Locator, Metadata, PriorityRange, Reliability},
+    transport::BatchSize,
+};
 use zenoh_result::ZResult;
 
 /*************************************/
 /*            GENERAL                */
 /*************************************/
+
+pub const BIND_SOCKET: &str = "bind";
+pub const BIND_INTERFACE: &str = "iface";
+pub const TCP_SO_SND_BUF: &str = "so_sndbuf";
+pub const TCP_SO_RCV_BUF: &str = "so_rcvbuf";
+pub const DSCP: &str = "dscp";
+
 #[derive(Clone, Debug, Serialize, Hash, PartialEq, Eq)]
 pub struct Link {
     pub src: Locator,
     pub dst: Locator,
     pub group: Option<Locator>,
-    pub mtu: u16,
-    pub is_reliable: bool,
+    pub mtu: BatchSize,
     pub is_streamed: bool,
+    pub interfaces: Vec<String>,
+    pub auth_identifier: LinkAuthId,
+    pub priorities: Option<PriorityRange>,
+    pub reliability: Option<Reliability>,
 }
 
 #[async_trait]
 pub trait LocatorInspector: Default {
     fn protocol(&self) -> &str;
     async fn is_multicast(&self, locator: &Locator) -> ZResult<bool>;
+    fn is_reliable(&self, locator: &Locator) -> ZResult<bool>;
 }
 
-#[async_trait]
 pub trait ConfigurationInspector<C>: Default {
-    async fn inspect_config(&self, configuration: &C) -> ZResult<String>;
+    fn inspect_config(&self, configuration: &C) -> ZResult<String>;
 }
 
 impl fmt::Display for Link {
@@ -62,47 +84,56 @@ impl fmt::Display for Link {
     }
 }
 
-impl From<&LinkUnicast> for Link {
-    fn from(link: &LinkUnicast) -> Link {
+impl Link {
+    pub fn new_unicast(
+        link: &LinkUnicast,
+        priorities: Option<PriorityRange>,
+        reliability: Option<Reliability>,
+    ) -> Self {
         Link {
-            src: link.get_src().to_owned(),
-            dst: link.get_dst().to_owned(),
+            src: Self::to_patched_locator(link.get_src(), priorities.as_ref(), reliability),
+            dst: Self::to_patched_locator(link.get_dst(), priorities.as_ref(), reliability),
             group: None,
             mtu: link.get_mtu(),
-            is_reliable: link.is_reliable(),
             is_streamed: link.is_streamed(),
+            interfaces: link.get_interface_names(),
+            auth_identifier: link.get_auth_id().clone(),
+            priorities,
+            reliability,
         }
     }
-}
 
-impl From<LinkUnicast> for Link {
-    fn from(link: LinkUnicast) -> Link {
-        Link::from(&link)
-    }
-}
-
-impl From<&LinkMulticast> for Link {
-    fn from(link: &LinkMulticast) -> Link {
+    pub fn new_multicast(link: &LinkMulticast) -> Self {
         Link {
             src: link.get_src().to_owned(),
             dst: link.get_dst().to_owned(),
             group: Some(link.get_dst().to_owned()),
             mtu: link.get_mtu(),
-            is_reliable: link.is_reliable(),
             is_streamed: false,
+            interfaces: vec![],
+            auth_identifier: link.get_auth_id().clone(),
+            priorities: None,
+            reliability: None,
         }
     }
-}
 
-impl From<LinkMulticast> for Link {
-    fn from(link: LinkMulticast) -> Link {
-        Link::from(&link)
-    }
-}
-
-impl PartialEq<LinkUnicast> for Link {
-    fn eq(&self, other: &LinkUnicast) -> bool {
-        self.src == *other.get_src() && self.dst == *other.get_dst()
+    /// Updates the metadata of the `locator` with `priorities` and `reliability`.
+    fn to_patched_locator(
+        locator: &Locator,
+        priorities: Option<&PriorityRange>,
+        reliability: Option<Reliability>,
+    ) -> Locator {
+        let mut locator = locator.clone();
+        let mut metadata = locator.metadata_mut();
+        reliability
+            .map(|r| metadata.insert(Metadata::RELIABILITY, r.to_string()))
+            .transpose()
+            .expect("adding `reliability` to Locator metadata should not fail");
+        priorities
+            .map(|ps| metadata.insert(Metadata::PRIORITIES, ps.to_string()))
+            .transpose()
+            .expect("adding `priorities` to Locator metadata should not fail");
+        locator
     }
 }
 

@@ -12,57 +12,48 @@
 #   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 #
 [package]
-rust-version = { workspace = true }
-name = "zenoh-ext"
-version = { workspace = true }
-repository = { workspace = true }
-homepage = { workspace = true }
-authors = ["kydos <angelo@icorsaro.net>", "Julien Enoch <julien@enoch.fr>"]
-edition = { workspace = true }
-license = { workspace = true }
+authors = ["Julien Enoch <julien@enoch.fr>", "kydos <angelo@icorsaro.net>"]
 categories = { workspace = true }
 description = "Zenoh: extensions to the client API."
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+name = "zenoh-ext"
+repository = { workspace = true }
+rust-version = { workspace = true }
+version = { workspace = true }
 
 [badges]
 maintenance = { status = "actively-developed" }
 
 [features]
-unstable = []
-default = []
+default = ["zenoh/default"]
+internal = []
+unstable = ["zenoh/internal", "zenoh/unstable"]
 
 [dependencies]
-async-std = { workspace = true, features = ["attributes", "unstable"] }
+async-trait = { workspace = true }
 bincode = { workspace = true }
-env_logger = { workspace = true }
 flume = { workspace = true }
 futures = { workspace = true }
-log = { workspace = true }
+leb128 = { workspace = true }
 serde = { workspace = true, features = ["default"] }
-zenoh = { workspace = true, features = ["unstable"], default-features = false }
-zenoh-core = { workspace = true }
+tokio = { workspace = true, features = [
+  "io-std",
+  "macros",
+  "rt",
+  "sync",
+  "time",
+] }
+tracing = { workspace = true }
+uhlc = { workspace = true }
+zenoh = { workspace = true, default-features = false }
 zenoh-macros = { workspace = true }
-zenoh-result = { workspace = true }
-zenoh-sync = { workspace = true }
 zenoh-util = { workspace = true }
 
 [dev-dependencies]
-clap = { workspace = true, features = ["derive"] }
-
-[[example]]
-name = "z_query_sub"
-path = "examples/z_query_sub.rs"
-
-[[example]]
-name = "z_pub_cache"
-path = "examples/z_pub_cache.rs"
-
-[[example]]
-name = "z_member"
-path = "examples/z_member.rs"
-
-[[example]]
-name = "z_view_size"
-path = "examples/z_view_size.rs"
+rand = { workspace = true }
+zenoh-config = { workspace = true }
 
 [package.metadata.docs.rs]
 features = ["unstable"]

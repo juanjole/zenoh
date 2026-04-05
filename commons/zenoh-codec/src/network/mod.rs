@@ -12,25 +12,62 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 mod declare;
+mod interest;
 mod oam;
 mod push;
 mod request;
 mod response;
 
-use crate::{
-    LCodec, RCodec, WCodec, Zenoh080, Zenoh080Header, Zenoh080Length, Zenoh080Reliability,
-};
 use zenoh_buffers::{
-    reader::{DidntRead, Reader},
+    reader::{BacktrackableReader, DidntRead, Reader},
     writer::{DidntWrite, Writer},
 };
 use zenoh_protocol::{
     common::{imsg, ZExtZ64, ZExtZBufHeader},
-    core::{Reliability, ZenohId},
-    network::{ext::EntityIdType, *},
+    core::{EntityId, Reliability, ZenohIdProto},
+    network::{
+        ext::{self, EntityGlobalIdType},
+        id, NetworkBody, NetworkBodyRef, NetworkMessage, NetworkMessageExt, NetworkMessageRef,
+    },
+};
+
+use crate::{
+    LCodec, RCodec, WCodec, Zenoh080, Zenoh080Header, Zenoh080Length, Zenoh080Reliability,
 };
 
 // NetworkMessage
+impl<W> WCodec<NetworkMessageRef<'_>, &mut W> for Zenoh080
+where
+    W: Writer,
+{
+    type Output = Result<(), DidntWrite>;
+
+    #[inline(always)]
+    fn write(self, writer: &mut W, x: NetworkMessageRef) -> Self::Output {
+        let NetworkMessageRef { body, .. } = x;
+        if let NetworkBodyRef::Push(b) = body {
+            return self.write(&mut *writer, b);
+        }
+        #[cold]
+        fn write_not_push<W: Writer>(
+            codec: Zenoh080,
+            writer: &mut W,
+            body: NetworkBodyRef,
+        ) -> Result<(), DidntWrite> {
+            match body {
+                NetworkBodyRef::Push(_) => unreachable!(),
+                NetworkBodyRef::Request(b) => codec.write(&mut *writer, b),
+                NetworkBodyRef::Response(b) => codec.write(&mut *writer, b),
+                NetworkBodyRef::ResponseFinal(b) => codec.write(&mut *writer, b),
+                NetworkBodyRef::Interest(b) => codec.write(&mut *writer, b),
+                NetworkBodyRef::Declare(b) => codec.write(&mut *writer, b),
+                NetworkBodyRef::OAM(b) => codec.write(&mut *writer, b),
+            }
+        }
+        write_not_push(self, writer, body)
+    }
+}
+
 impl<W> WCodec<&NetworkMessage, &mut W> for Zenoh080
 where
     W: Writer,
@@ -38,16 +75,7 @@ where
     type Output = Result<(), DidntWrite>;
 
     fn write(self, writer: &mut W, x: &NetworkMessage) -> Self::Output {
-        let NetworkMessage { body, .. } = x;
-
-        match body {
-            NetworkBody::Push(b) => self.write(&mut *writer, b),
-            NetworkBody::Request(b) => self.write(&mut *writer, b),
-            NetworkBody::Response(b) => self.write(&mut *writer, b),
-            NetworkBody::ResponseFinal(b) => self.write(&mut *writer, b),
-            NetworkBody::Declare(b) => self.write(&mut *writer, b),
-            NetworkBody::OAM(b) => self.write(&mut *writer, b),
-        }
+        self.write(writer, x.as_ref())
     }
 }
 
@@ -58,7 +86,7 @@ where
     type Error = DidntRead;
 
     fn read(self, reader: &mut R) -> Result<NetworkMessage, Self::Error> {
-        let codec = Zenoh080Reliability::new(Reliability::default());
+        let codec = Zenoh080Reliability::new(Reliability::DEFAULT);
         codec.read(reader)
     }
 }
@@ -69,11 +97,14 @@ where
 {
     type Error = DidntRead;
 
+    #[inline(always)]
     fn read(self, reader: &mut R) -> Result<NetworkMessage, Self::Error> {
         let header: u8 = self.codec.read(&mut *reader)?;
 
         let codec = Zenoh080Header::new(header);
-        codec.read(&mut *reader)
+        let mut msg: NetworkMessage = codec.read(&mut *reader)?;
+        msg.reliability = self.reliability;
+        Ok(msg)
     }
 }
 
@@ -83,18 +114,54 @@ where
 {
     type Error = DidntRead;
 
+    #[inline(always)]
     fn read(self, reader: &mut R) -> Result<NetworkMessage, Self::Error> {
-        let body = match imsg::mid(self.header) {
-            id::PUSH => NetworkBody::Push(self.read(&mut *reader)?),
-            id::REQUEST => NetworkBody::Request(self.read(&mut *reader)?),
-            id::RESPONSE => NetworkBody::Response(self.read(&mut *reader)?),
-            id::RESPONSE_FINAL => NetworkBody::ResponseFinal(self.read(&mut *reader)?),
-            id::DECLARE => NetworkBody::Declare(self.read(&mut *reader)?),
-            id::OAM => NetworkBody::OAM(self.read(&mut *reader)?),
-            _ => return Err(DidntRead),
-        };
+        if imsg::mid(self.header) == id::PUSH {
+            return Ok(NetworkBody::Push(self.read(&mut *reader)?).into());
+        }
+        #[cold]
+        fn read_not_push<R: Reader>(
+            header: Zenoh080Header,
+            reader: &mut R,
+        ) -> Result<NetworkMessage, DidntRead> {
+            let body = match imsg::mid(header.header) {
+                id::REQUEST => NetworkBody::Request(header.read(&mut *reader)?),
+                id::RESPONSE => NetworkBody::Response(header.read(&mut *reader)?),
+                id::RESPONSE_FINAL => NetworkBody::ResponseFinal(header.read(&mut *reader)?),
+                id::INTEREST => NetworkBody::Interest(header.read(&mut *reader)?),
+                id::DECLARE => NetworkBody::Declare(header.read(&mut *reader)?),
+                id::OAM => NetworkBody::OAM(header.read(&mut *reader)?),
+                _ => return Err(DidntRead),
+            };
 
-        Ok(body.into())
+            Ok(body.into())
+        }
+        read_not_push(self, reader)
+    }
+}
+
+pub struct NetworkMessageIter<R> {
+    codec: Zenoh080Reliability,
+    reader: R,
+}
+
+impl<R> NetworkMessageIter<R> {
+    pub fn new(reliability: Reliability, reader: R) -> Self {
+        let codec = Zenoh080Reliability::new(reliability);
+        Self { codec, reader }
+    }
+}
+
+impl<R: BacktrackableReader> Iterator for NetworkMessageIter<R> {
+    type Item = NetworkMessage;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mark = self.reader.mark();
+        let msg = self.codec.read(&mut self.reader).ok();
+        if msg.is_none() {
+            self.reader.rewind(mark);
+        }
+        msg
     }
 }
 
@@ -218,21 +285,21 @@ where
 }
 
 // Extension: EntityId
-impl<const ID: u8> LCodec<&ext::EntityIdType<{ ID }>> for Zenoh080 {
-    fn w_len(self, x: &ext::EntityIdType<{ ID }>) -> usize {
-        let EntityIdType { zid, eid } = x;
+impl<const ID: u8> LCodec<&ext::EntityGlobalIdType<{ ID }>> for Zenoh080 {
+    fn w_len(self, x: &ext::EntityGlobalIdType<{ ID }>) -> usize {
+        let EntityGlobalIdType { zid, eid } = x;
 
         1 + self.w_len(zid) + self.w_len(*eid)
     }
 }
 
-impl<W, const ID: u8> WCodec<(&ext::EntityIdType<{ ID }>, bool), &mut W> for Zenoh080
+impl<W, const ID: u8> WCodec<(&ext::EntityGlobalIdType<{ ID }>, bool), &mut W> for Zenoh080
 where
     W: Writer,
 {
     type Output = Result<(), DidntWrite>;
 
-    fn write(self, writer: &mut W, x: (&ext::EntityIdType<{ ID }>, bool)) -> Self::Output {
+    fn write(self, writer: &mut W, x: (&ext::EntityGlobalIdType<{ ID }>, bool)) -> Self::Output {
         let (x, more) = x;
         let header: ZExtZBufHeader<{ ID }> = ZExtZBufHeader::new(self.w_len(x));
         self.write(&mut *writer, (&header, more))?;
@@ -248,23 +315,23 @@ where
     }
 }
 
-impl<R, const ID: u8> RCodec<(ext::EntityIdType<{ ID }>, bool), &mut R> for Zenoh080Header
+impl<R, const ID: u8> RCodec<(ext::EntityGlobalIdType<{ ID }>, bool), &mut R> for Zenoh080Header
 where
     R: Reader,
 {
     type Error = DidntRead;
 
-    fn read(self, reader: &mut R) -> Result<(ext::EntityIdType<{ ID }>, bool), Self::Error> {
+    fn read(self, reader: &mut R) -> Result<(ext::EntityGlobalIdType<{ ID }>, bool), Self::Error> {
         let (_, more): (ZExtZBufHeader<{ ID }>, bool) = self.read(&mut *reader)?;
 
         let flags: u8 = self.codec.read(&mut *reader)?;
         let length = 1 + ((flags >> 4) as usize);
 
         let lodec = Zenoh080Length::new(length);
-        let zid: ZenohId = lodec.read(&mut *reader)?;
+        let zid: ZenohIdProto = lodec.read(&mut *reader)?;
 
-        let eid: u32 = self.codec.read(&mut *reader)?;
+        let eid: EntityId = self.codec.read(&mut *reader)?;
 
-        Ok((ext::EntityIdType { zid, eid }, more))
+        Ok((ext::EntityGlobalIdType { zid, eid }, more))
     }
 }

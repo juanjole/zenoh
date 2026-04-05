@@ -15,6 +15,7 @@ use core::{
     convert::TryFrom,
     fmt::{self, Debug},
 };
+
 use zenoh_buffers::ZBuf;
 
 /// # Zenoh extensions
@@ -110,6 +111,12 @@ pub struct DidntConvert;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ZExtUnit<const ID: u8>;
 
+impl<const ID: u8> Default for ZExtUnit<{ ID }> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<const ID: u8> ZExtUnit<{ ID }> {
     pub const ID: u8 = ID;
 
@@ -130,6 +137,7 @@ impl<const ID: u8> ZExtUnit<{ ID }> {
     }
 
     #[cfg(feature = "test")]
+    #[doc(hidden)]
     pub fn rand() -> Self {
         Self::new()
     }
@@ -183,6 +191,7 @@ impl<const ID: u8> ZExtZ64<{ ID }> {
     }
 
     #[cfg(feature = "test")]
+    #[doc(hidden)]
     pub fn rand() -> Self {
         use rand::Rng;
 
@@ -240,6 +249,7 @@ impl<const ID: u8> ZExtZBuf<{ ID }> {
     }
 
     #[cfg(feature = "test")]
+    #[doc(hidden)]
     pub fn rand() -> Self {
         use rand::Rng;
 
@@ -300,8 +310,9 @@ impl<const ID: u8> Debug for ZExtZBufHeader<{ ID }> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum ZExtBody {
+    #[default]
     Unit,
     Z64(u64),
     ZBuf(ZBuf),
@@ -309,6 +320,7 @@ pub enum ZExtBody {
 
 impl ZExtBody {
     #[cfg(feature = "test")]
+    #[doc(hidden)]
     pub fn rand() -> Self {
         use rand::{seq::SliceRandom, Rng};
         let mut rng = rand::thread_rng();
@@ -345,6 +357,7 @@ impl ZExtUnknown {
     }
 
     #[cfg(feature = "test")]
+    #[doc(hidden)]
     pub fn rand() -> Self {
         use rand::Rng;
         let mut rng = rand::thread_rng();
@@ -356,6 +369,7 @@ impl ZExtUnknown {
     }
 
     #[cfg(feature = "test")]
+    #[doc(hidden)]
     pub fn rand2(start: u8, mandatory: bool) -> Self {
         use rand::Rng;
         let mut rng = rand::thread_rng();
@@ -414,20 +428,20 @@ impl<const ID: u8> From<ZExtZBuf<{ ID }>> for ZExtUnknown {
 #[macro_export]
 macro_rules! zextunit {
     ($id:expr, $m:expr) => {
-        ZExtUnit<{ ZExtUnit::<$id>::id($m) }>
+        $crate::common::extension::ZExtUnit<{ $crate::common::extension::ZExtUnit::<$id>::id($m) }>
     }
 }
 
 #[macro_export]
 macro_rules! zextz64 {
     ($id:expr, $m:expr) => {
-        ZExtZ64<{ ZExtZ64::<$id>::id($m) }>
+        $crate::common::extension::ZExtZ64<{ $crate::common::extension::ZExtZ64::<$id>::id($m) }>
     }
 }
 
 #[macro_export]
 macro_rules! zextzbuf {
     ($id:expr, $m:expr) => {
-        ZExtZBuf<{ ZExtZBuf::<$id>::id($m) }>
+        $crate::common::extension::ZExtZBuf<{ $crate::common::extension::ZExtZBuf::<$id>::id($m) }>
     }
 }

@@ -16,42 +16,53 @@
 //!
 //! This crate is intended for Zenoh's internal use.
 //!
-//! [Click here for Zenoh's documentation](../zenoh/index.html)
+//! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
 use std::collections::HashMap;
+
 use zenoh_config::Config;
-use zenoh_result::{bail, ZResult};
-
-#[cfg(feature = "transport_tcp")]
-pub use zenoh_link_tcp as tcp;
-#[cfg(feature = "transport_tcp")]
-use zenoh_link_tcp::{LinkManagerUnicastTcp, TcpLocatorInspector, TCP_LOCATOR_PREFIX};
-
-#[cfg(feature = "transport_udp")]
-pub use zenoh_link_udp as udp;
-#[cfg(feature = "transport_udp")]
-use zenoh_link_udp::{
-    LinkManagerMulticastUdp, LinkManagerUnicastUdp, UdpLocatorInspector, UDP_LOCATOR_PREFIX,
-};
-
-#[cfg(feature = "transport_tls")]
-pub use zenoh_link_tls as tls;
-#[cfg(feature = "transport_tls")]
-use zenoh_link_tls::{
-    LinkManagerUnicastTls, TlsConfigurator, TlsLocatorInspector, TLS_LOCATOR_PREFIX,
-};
-
+pub use zenoh_link_commons::*;
 #[cfg(feature = "transport_quic")]
 pub use zenoh_link_quic as quic;
 #[cfg(feature = "transport_quic")]
 use zenoh_link_quic::{
     LinkManagerUnicastQuic, QuicConfigurator, QuicLocatorInspector, QUIC_LOCATOR_PREFIX,
 };
-
-#[cfg(feature = "transport_ws")]
-pub use zenoh_link_ws as ws;
-#[cfg(feature = "transport_ws")]
-use zenoh_link_ws::{LinkManagerUnicastWs, WsLocatorInspector, WS_LOCATOR_PREFIX};
-
+#[cfg(feature = "transport_quic_datagram")]
+pub use zenoh_link_quic_datagram as quic_datagram;
+#[cfg(all(feature = "transport_quic_datagram", not(feature = "transport_quic")))]
+use zenoh_link_quic_datagram::QUIC_DATAGRAM_LOCATOR_PREFIX;
+#[cfg(feature = "transport_quic_datagram")]
+use zenoh_link_quic_datagram::{
+    LinkManagerUnicastQuicDatagram, QuicDatagramConfigurator, QuicDatagramLocatorInspector,
+};
+#[cfg(feature = "transport_serial")]
+pub use zenoh_link_serial as serial;
+#[cfg(feature = "transport_serial")]
+use zenoh_link_serial::{LinkManagerUnicastSerial, SerialLocatorInspector, SERIAL_LOCATOR_PREFIX};
+#[cfg(feature = "transport_tcp")]
+pub use zenoh_link_tcp as tcp;
+#[cfg(feature = "transport_tcp")]
+use zenoh_link_tcp::{
+    LinkManagerUnicastTcp, TcpConfigurator, TcpLocatorInspector, TCP_LOCATOR_PREFIX,
+};
+#[cfg(feature = "transport_tls")]
+pub use zenoh_link_tls as tls;
+#[cfg(feature = "transport_tls")]
+use zenoh_link_tls::{
+    LinkManagerUnicastTls, TlsConfigurator, TlsLocatorInspector, TLS_LOCATOR_PREFIX,
+};
+#[cfg(feature = "transport_udp")]
+pub use zenoh_link_udp as udp;
+#[cfg(feature = "transport_udp")]
+use zenoh_link_udp::{
+    LinkManagerMulticastUdp, LinkManagerUnicastUdp, UdpLocatorInspector, UDP_LOCATOR_PREFIX,
+};
+#[cfg(feature = "transport_unixpipe")]
+pub use zenoh_link_unixpipe as unixpipe;
+#[cfg(feature = "transport_unixpipe")]
+use zenoh_link_unixpipe::{
+    LinkManagerUnicastPipe, UnixPipeConfigurator, UnixPipeLocatorInspector, UNIXPIPE_LOCATOR_PREFIX,
+};
 #[cfg(all(feature = "transport_unixsock-stream", target_family = "unix"))]
 pub use zenoh_link_unixsock_stream as unixsock_stream;
 #[cfg(all(feature = "transport_unixsock-stream", target_family = "unix"))]
@@ -59,45 +70,161 @@ use zenoh_link_unixsock_stream::{
     LinkManagerUnicastUnixSocketStream, UnixSockStreamLocatorInspector,
     UNIXSOCKSTREAM_LOCATOR_PREFIX,
 };
-
-#[cfg(feature = "transport_serial")]
-pub use zenoh_link_serial as serial;
-#[cfg(feature = "transport_serial")]
-use zenoh_link_serial::{LinkManagerUnicastSerial, SerialLocatorInspector, SERIAL_LOCATOR_PREFIX};
-
-#[cfg(feature = "transport_unixpipe")]
-pub use zenoh_link_unixpipe as unixpipe;
-#[cfg(feature = "transport_unixpipe")]
-use zenoh_link_unixpipe::{
-    LinkManagerUnicastPipe, UnixPipeConfigurator, UnixPipeLocatorInspector, UNIXPIPE_LOCATOR_PREFIX,
-};
-
-pub use zenoh_link_commons::*;
+#[cfg(all(feature = "transport_vsock", target_os = "linux"))]
+pub use zenoh_link_vsock as vsock;
+#[cfg(all(feature = "transport_vsock", target_os = "linux"))]
+use zenoh_link_vsock::{LinkManagerUnicastVsock, VsockLocatorInspector, VSOCK_LOCATOR_PREFIX};
+#[cfg(feature = "transport_ws")]
+pub use zenoh_link_ws as ws;
+#[cfg(feature = "transport_ws")]
+use zenoh_link_ws::{LinkManagerUnicastWs, WsLocatorInspector, WS_LOCATOR_PREFIX};
 pub use zenoh_protocol::core::{EndPoint, Locator};
+use zenoh_result::{bail, ZResult};
 
-pub const PROTOCOLS: &[&str] = &[
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LinkKind {
+    Quic,
+    QuicDatagram,
+    Serial,
+    Tcp,
+    Tls,
+    Udp,
+    Unixpipe,
+    UnixsockStream,
+    Vscock,
+    Ws,
+}
+
+impl LinkKind {
+    pub fn new_supported_links<'p>(protocols: impl Iterator<Item = &'p str>) -> Vec<LinkKind> {
+        #[allow(unused_mut)]
+        let mut supported_links = Vec::new();
+        for p in protocols {
+            match p {
+                #[cfg(feature = "transport_tcp")]
+                TCP_LOCATOR_PREFIX => supported_links.push(LinkKind::Tcp),
+                #[cfg(feature = "transport_udp")]
+                UDP_LOCATOR_PREFIX => supported_links.push(LinkKind::Udp),
+                #[cfg(feature = "transport_tls")]
+                TLS_LOCATOR_PREFIX => supported_links.push(LinkKind::Tls),
+                #[cfg(all(feature = "transport_quic_datagram", not(feature = "transport_quic")))]
+                QUIC_DATAGRAM_LOCATOR_PREFIX => supported_links.push(LinkKind::QuicDatagram),
+                #[cfg(all(feature = "transport_quic", not(feature = "transport_quic_datagram")))]
+                QUIC_LOCATOR_PREFIX => supported_links.push(LinkKind::Quic),
+                #[cfg(all(feature = "transport_quic", feature = "transport_quic_datagram"))]
+                QUIC_LOCATOR_PREFIX => {
+                    supported_links.push(LinkKind::Quic);
+                    supported_links.push(LinkKind::QuicDatagram);
+                }
+                #[cfg(all(feature = "transport_unixsock-stream", target_family = "unix"))]
+                UNIXSOCKSTREAM_LOCATOR_PREFIX => supported_links.push(LinkKind::UnixsockStream),
+                #[cfg(feature = "transport_ws")]
+                WS_LOCATOR_PREFIX => supported_links.push(LinkKind::Ws),
+                #[cfg(feature = "transport_serial")]
+                SERIAL_LOCATOR_PREFIX => supported_links.push(LinkKind::Serial),
+                #[cfg(feature = "transport_unixpipe")]
+                UNIXPIPE_LOCATOR_PREFIX => supported_links.push(LinkKind::Unixpipe),
+                #[cfg(all(feature = "transport_vsock", target_os = "linux"))]
+                VSOCK_LOCATOR_PREFIX => supported_links.push(LinkKind::Vscock),
+                _ => {}
+            }
+        }
+        supported_links
+    }
+}
+
+impl TryFrom<&Locator> for LinkKind {
+    type Error = zenoh_result::Error;
+
+    fn try_from(locator: &Locator) -> Result<Self, Self::Error> {
+        #[allow(unused_imports)]
+        use zenoh_link_commons::LocatorInspector;
+        match locator.protocol().as_str() {
+            #[cfg(feature = "transport_tcp")]
+            TCP_LOCATOR_PREFIX => Ok(LinkKind::Tcp),
+            #[cfg(feature = "transport_udp")]
+            UDP_LOCATOR_PREFIX => Ok(LinkKind::Udp),
+            #[cfg(feature = "transport_tls")]
+            TLS_LOCATOR_PREFIX => Ok(LinkKind::Tls),
+            #[cfg(all(feature = "transport_quic_datagram", not(feature = "transport_quic")))]
+            QUIC_DATAGRAM_LOCATOR_PREFIX => {
+                if !QuicDatagramLocatorInspector.is_reliable(locator)? {
+                    Ok(LinkKind::QuicDatagram)
+                } else {
+                    Err(zenoh_result::zerror!("Attempted to use a reliable QUIC link without enabling the transport_quic feature").into())
+                }
+            }
+            #[cfg(all(feature = "transport_quic", not(feature = "transport_quic_datagram")))]
+            QUIC_LOCATOR_PREFIX => {
+                if QuicLocatorInspector.is_reliable(locator)? {
+                    Ok(LinkKind::Quic)
+                } else {
+                    Err(zenoh_result::zerror!("Cannot use unreliable QUIC without enabling the transport_quic_datagram feature").into())
+                }
+            }
+            #[cfg(all(feature = "transport_quic", feature = "transport_quic_datagram"))]
+            QUIC_LOCATOR_PREFIX => {
+                if QuicLocatorInspector.is_reliable(locator)? {
+                    Ok(LinkKind::Quic)
+                } else {
+                    Ok(LinkKind::QuicDatagram)
+                }
+            }
+            #[cfg(all(feature = "transport_unixsock-stream", target_family = "unix"))]
+            UNIXSOCKSTREAM_LOCATOR_PREFIX => Ok(LinkKind::UnixsockStream),
+            #[cfg(feature = "transport_ws")]
+            WS_LOCATOR_PREFIX => Ok(LinkKind::Ws),
+            #[cfg(feature = "transport_serial")]
+            SERIAL_LOCATOR_PREFIX => Ok(LinkKind::Serial),
+            #[cfg(feature = "transport_unixpipe")]
+            UNIXPIPE_LOCATOR_PREFIX => Ok(LinkKind::Unixpipe),
+            #[cfg(all(feature = "transport_vsock", target_os = "linux"))]
+            VSOCK_LOCATOR_PREFIX => Ok(LinkKind::Vscock),
+            _ => bail!(
+                "Unicast not supported for {} protocol",
+                locator.protocol().as_str()
+            ),
+        }
+    }
+}
+
+impl TryFrom<&EndPoint> for LinkKind {
+    type Error = zenoh_result::Error;
+
+    fn try_from(endpoint: &EndPoint) -> Result<Self, Self::Error> {
+        LinkKind::try_from(&endpoint.to_locator())
+    }
+}
+
+pub const ALL_SUPPORTED_LINKS: &[LinkKind] = &[
     #[cfg(feature = "transport_quic")]
-    quic::QUIC_LOCATOR_PREFIX,
+    LinkKind::Quic,
+    #[cfg(feature = "transport_quic_datagram")]
+    LinkKind::QuicDatagram,
     #[cfg(feature = "transport_tcp")]
-    tcp::TCP_LOCATOR_PREFIX,
+    LinkKind::Tcp,
     #[cfg(feature = "transport_tls")]
-    tls::TLS_LOCATOR_PREFIX,
+    LinkKind::Tls,
     #[cfg(feature = "transport_udp")]
-    udp::UDP_LOCATOR_PREFIX,
+    LinkKind::Udp,
     #[cfg(feature = "transport_ws")]
-    ws::WS_LOCATOR_PREFIX,
+    LinkKind::Ws,
     #[cfg(all(feature = "transport_unixsock-stream", target_family = "unix"))]
-    unixsock_stream::UNIXSOCKSTREAM_LOCATOR_PREFIX,
+    LinkKind::UnixsockStream,
     #[cfg(feature = "transport_serial")]
-    serial::SERIAL_LOCATOR_PREFIX,
+    LinkKind::Serial,
     #[cfg(feature = "transport_unixpipe")]
-    unixpipe::UNIXPIPE_LOCATOR_PREFIX,
+    LinkKind::Unixpipe,
+    #[cfg(all(feature = "transport_vsock", target_os = "linux"))]
+    LinkKind::Vscock,
 ];
 
 #[derive(Default, Clone)]
 pub struct LocatorInspector {
     #[cfg(feature = "transport_quic")]
     quic_inspector: QuicLocatorInspector,
+    #[cfg(feature = "transport_quic_datagram")]
+    quic_datagram_inspector: QuicDatagramLocatorInspector,
     #[cfg(feature = "transport_tcp")]
     tcp_inspector: TcpLocatorInspector,
     #[cfg(feature = "transport_tls")]
@@ -112,37 +239,74 @@ pub struct LocatorInspector {
     serial_inspector: SerialLocatorInspector,
     #[cfg(feature = "transport_unixpipe")]
     unixpipe_inspector: UnixPipeLocatorInspector,
+    #[cfg(all(feature = "transport_vsock", target_os = "linux"))]
+    vsock_inspector: VsockLocatorInspector,
 }
 impl LocatorInspector {
+    pub fn is_reliable(&self, locator: &Locator) -> ZResult<bool> {
+        #[allow(unused_imports)]
+        use zenoh_link_commons::LocatorInspector;
+        match LinkKind::try_from(locator)? {
+            #[cfg(feature = "transport_tcp")]
+            LinkKind::Tcp => self.tcp_inspector.is_reliable(locator),
+            #[cfg(feature = "transport_udp")]
+            LinkKind::Udp => self.udp_inspector.is_reliable(locator),
+            #[cfg(feature = "transport_tls")]
+            LinkKind::Tls => self.tls_inspector.is_reliable(locator),
+            #[cfg(feature = "transport_quic")]
+            LinkKind::Quic => self.quic_inspector.is_reliable(locator),
+            #[cfg(feature = "transport_quic_datagram")]
+            LinkKind::QuicDatagram => self.quic_datagram_inspector.is_reliable(locator),
+            #[cfg(all(feature = "transport_unixsock-stream", target_family = "unix"))]
+            LinkKind::UnixsockStream => self.unixsock_stream_inspector.is_reliable(locator),
+            #[cfg(feature = "transport_ws")]
+            LinkKind::Ws => self.ws_inspector.is_reliable(locator),
+            #[cfg(feature = "transport_serial")]
+            LinkKind::Serial => self.serial_inspector.is_reliable(locator),
+            #[cfg(feature = "transport_unixpipe")]
+            LinkKind::Unixpipe => self.unixpipe_inspector.is_reliable(locator),
+            #[cfg(all(feature = "transport_vsock", target_os = "linux"))]
+            LinkKind::Vscock => self.vsock_inspector.is_reliable(locator),
+            #[allow(unreachable_patterns)]
+            _ => unreachable!(),
+        }
+    }
+
     pub async fn is_multicast(&self, locator: &Locator) -> ZResult<bool> {
         #[allow(unused_imports)]
         use zenoh_link_commons::LocatorInspector;
-        let protocol = locator.protocol();
-        match protocol.as_str() {
+        match LinkKind::try_from(locator)? {
             #[cfg(feature = "transport_tcp")]
-            TCP_LOCATOR_PREFIX => self.tcp_inspector.is_multicast(locator).await,
+            LinkKind::Tcp => self.tcp_inspector.is_multicast(locator).await,
             #[cfg(feature = "transport_udp")]
-            UDP_LOCATOR_PREFIX => self.udp_inspector.is_multicast(locator).await,
+            LinkKind::Udp => self.udp_inspector.is_multicast(locator).await,
             #[cfg(feature = "transport_tls")]
-            TLS_LOCATOR_PREFIX => self.tls_inspector.is_multicast(locator).await,
+            LinkKind::Tls => self.tls_inspector.is_multicast(locator).await,
             #[cfg(feature = "transport_quic")]
-            QUIC_LOCATOR_PREFIX => self.quic_inspector.is_multicast(locator).await,
+            LinkKind::Quic => self.quic_inspector.is_multicast(locator).await,
+            #[cfg(feature = "transport_quic_datagram")]
+            LinkKind::QuicDatagram => self.quic_datagram_inspector.is_multicast(locator).await,
             #[cfg(all(feature = "transport_unixsock-stream", target_family = "unix"))]
-            UNIXSOCKSTREAM_LOCATOR_PREFIX => {
-                self.unixsock_stream_inspector.is_multicast(locator).await
-            }
+            LinkKind::UnixsockStream => self.unixsock_stream_inspector.is_multicast(locator).await,
             #[cfg(feature = "transport_ws")]
-            WS_LOCATOR_PREFIX => self.ws_inspector.is_multicast(locator).await,
+            LinkKind::Ws => self.ws_inspector.is_multicast(locator).await,
             #[cfg(feature = "transport_serial")]
-            SERIAL_LOCATOR_PREFIX => self.serial_inspector.is_multicast(locator).await,
+            LinkKind::Serial => self.serial_inspector.is_multicast(locator).await,
             #[cfg(feature = "transport_unixpipe")]
-            UNIXPIPE_LOCATOR_PREFIX => self.unixpipe_inspector.is_multicast(locator).await,
-            _ => bail!("Unsupported protocol: {}.", protocol),
+            LinkKind::Unixpipe => self.unixpipe_inspector.is_multicast(locator).await,
+            #[cfg(all(feature = "transport_vsock", target_os = "linux"))]
+            LinkKind::Vscock => self.vsock_inspector.is_multicast(locator).await,
+            #[allow(unreachable_patterns)]
+            _ => unreachable!(),
         }
     }
 }
 #[derive(Default)]
 pub struct LinkConfigurator {
+    #[cfg(feature = "transport_tcp")]
+    tcp_inspector: TcpConfigurator,
+    #[cfg(feature = "transport_quic_datagram")]
+    quic_datagram_inspector: QuicDatagramConfigurator,
     #[cfg(feature = "transport_quic")]
     quic_inspector: QuicConfigurator,
     #[cfg(feature = "transport_tls")]
@@ -153,42 +317,47 @@ pub struct LinkConfigurator {
 
 impl LinkConfigurator {
     #[allow(unused_variables, unused_mut)]
-    pub async fn configurations(
+    pub fn configurations(
         &self,
         config: &Config,
     ) -> (
-        HashMap<String, String>,
-        HashMap<String, zenoh_result::Error>,
+        HashMap<LinkKind, String>,
+        HashMap<LinkKind, zenoh_result::Error>,
     ) {
-        let mut configs = HashMap::new();
-        let mut errors = HashMap::new();
-        let mut insert_config = |proto: String, cfg: ZResult<String>| match cfg {
+        let mut configs = HashMap::<LinkKind, String>::new();
+        let mut errors = HashMap::<LinkKind, zenoh_result::Error>::new();
+        let mut insert_config = |kind: LinkKind, cfg: ZResult<String>| match cfg {
             Ok(v) => {
-                configs.insert(proto, v);
+                configs.insert(kind, v);
             }
             Err(e) => {
-                errors.insert(proto, e);
+                errors.insert(kind, e);
             }
         };
-        #[cfg(feature = "transport_quic")]
+        #[cfg(feature = "transport_tcp")]
+        {
+            insert_config(LinkKind::Tcp, self.tcp_inspector.inspect_config(config));
+        }
+        #[cfg(feature = "transport_quic_datagram")]
         {
             insert_config(
-                QUIC_LOCATOR_PREFIX.into(),
-                self.quic_inspector.inspect_config(config).await,
+                LinkKind::QuicDatagram,
+                self.quic_datagram_inspector.inspect_config(config),
             );
+        }
+        #[cfg(feature = "transport_quic")]
+        {
+            insert_config(LinkKind::Quic, self.quic_inspector.inspect_config(config));
         }
         #[cfg(feature = "transport_tls")]
         {
-            insert_config(
-                TLS_LOCATOR_PREFIX.into(),
-                self.tls_inspector.inspect_config(config).await,
-            );
+            insert_config(LinkKind::Tls, self.tls_inspector.inspect_config(config));
         }
         #[cfg(feature = "transport_unixpipe")]
         {
             insert_config(
-                UNIXPIPE_LOCATOR_PREFIX.into(),
-                self.unixpipe_inspector.inspect_config(config).await,
+                LinkKind::Unixpipe,
+                self.unixpipe_inspector.inspect_config(config),
             );
         }
         (configs, errors)
@@ -202,31 +371,39 @@ impl LinkConfigurator {
 pub struct LinkManagerBuilderUnicast;
 
 impl LinkManagerBuilderUnicast {
-    pub fn make(_manager: NewLinkChannelSender, protocol: &str) -> ZResult<LinkManagerUnicast> {
-        match protocol {
+    pub fn make(
+        _manager: NewLinkChannelSender,
+        endpoint: &EndPoint,
+    ) -> ZResult<LinkManagerUnicast> {
+        #[allow(unused_imports)]
+        use zenoh_link_commons::LocatorInspector;
+        match LinkKind::try_from(endpoint)? {
             #[cfg(feature = "transport_tcp")]
-            TCP_LOCATOR_PREFIX => Ok(std::sync::Arc::new(LinkManagerUnicastTcp::new(_manager))),
+            LinkKind::Tcp => Ok(std::sync::Arc::new(LinkManagerUnicastTcp::new(_manager))),
             #[cfg(feature = "transport_udp")]
-            UDP_LOCATOR_PREFIX => Ok(std::sync::Arc::new(LinkManagerUnicastUdp::new(_manager))),
+            LinkKind::Udp => Ok(std::sync::Arc::new(LinkManagerUnicastUdp::new(_manager))),
             #[cfg(feature = "transport_tls")]
-            TLS_LOCATOR_PREFIX => Ok(std::sync::Arc::new(LinkManagerUnicastTls::new(_manager))),
+            LinkKind::Tls => Ok(std::sync::Arc::new(LinkManagerUnicastTls::new(_manager))),
+            #[cfg(feature = "transport_quic_datagram")]
+            LinkKind::QuicDatagram => Ok(std::sync::Arc::new(LinkManagerUnicastQuicDatagram::new(
+                _manager,
+            ))),
             #[cfg(feature = "transport_quic")]
-            QUIC_LOCATOR_PREFIX => Ok(std::sync::Arc::new(LinkManagerUnicastQuic::new(_manager))),
+            LinkKind::Quic => Ok(std::sync::Arc::new(LinkManagerUnicastQuic::new(_manager))),
             #[cfg(all(feature = "transport_unixsock-stream", target_family = "unix"))]
-            UNIXSOCKSTREAM_LOCATOR_PREFIX => Ok(std::sync::Arc::new(
+            LinkKind::UnixsockStream => Ok(std::sync::Arc::new(
                 LinkManagerUnicastUnixSocketStream::new(_manager),
             )),
             #[cfg(feature = "transport_ws")]
-            WS_LOCATOR_PREFIX => Ok(std::sync::Arc::new(LinkManagerUnicastWs::new(_manager))),
+            LinkKind::Ws => Ok(std::sync::Arc::new(LinkManagerUnicastWs::new(_manager))),
             #[cfg(feature = "transport_serial")]
-            SERIAL_LOCATOR_PREFIX => {
-                Ok(std::sync::Arc::new(LinkManagerUnicastSerial::new(_manager)))
-            }
+            LinkKind::Serial => Ok(std::sync::Arc::new(LinkManagerUnicastSerial::new(_manager))),
             #[cfg(feature = "transport_unixpipe")]
-            UNIXPIPE_LOCATOR_PREFIX => {
-                Ok(std::sync::Arc::new(LinkManagerUnicastPipe::new(_manager)))
-            }
-            _ => bail!("Unicast not supported for {} protocol", protocol),
+            LinkKind::Unixpipe => Ok(std::sync::Arc::new(LinkManagerUnicastPipe::new(_manager))),
+            #[cfg(all(feature = "transport_vsock", target_os = "linux"))]
+            LinkKind::Vscock => Ok(std::sync::Arc::new(LinkManagerUnicastVsock::new(_manager))),
+            #[allow(unreachable_patterns)]
+            _ => unreachable!(),
         }
     }
 }
@@ -238,11 +415,11 @@ impl LinkManagerBuilderUnicast {
 pub struct LinkManagerBuilderMulticast;
 
 impl LinkManagerBuilderMulticast {
-    pub fn make(protocol: &str) -> ZResult<LinkManagerMulticast> {
-        match protocol {
+    pub fn make(link_kind: LinkKind) -> ZResult<LinkManagerMulticast> {
+        match link_kind {
             #[cfg(feature = "transport_udp")]
-            UDP_LOCATOR_PREFIX => Ok(std::sync::Arc::new(LinkManagerMulticastUdp)),
-            _ => bail!("Multicast not supported for {} protocol", protocol),
+            LinkKind::Udp => Ok(std::sync::Arc::new(LinkManagerMulticastUdp)),
+            _ => bail!("Multicast not supported for link {link_kind:?}"),
         }
     }
 }

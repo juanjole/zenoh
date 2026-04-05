@@ -14,8 +14,8 @@
 use zenoh_buffers::{
     reader::{HasReader, Reader, SiphonableReader},
     writer::{BacktrackableWriter, HasWriter, Writer},
+    BBuf, ZBuf, ZSlice,
 };
-use zenoh_buffers::{BBuf, ZBuf, ZSlice};
 
 const BYTES: usize = 18;
 
@@ -30,6 +30,7 @@ const WBSN: [u8; 4] = [u8::MAX, u8::MAX, u8::MAX, u8::MAX];
 macro_rules! run_write {
     ($buffer:expr) => {
         println!(">>> Write");
+        #[allow(unused_mut)]
         let mut writer = $buffer.writer();
 
         writer.write_u8(WBS0).unwrap();
@@ -46,19 +47,22 @@ macro_rules! run_write {
 
         writer.write_exact(&WBS4).unwrap();
 
-        writer
-            .with_slot(4, |mut buffer| {
+        // SAFETY: callback returns the length of the buffer, which is guaranteed to be 4.
+        unsafe {
+            writer.with_slot(4, |mut buffer| {
                 let w = buffer.write(&WBS5).unwrap();
                 assert_eq!(4, w.get());
                 w.get()
             })
-            .unwrap();
+        }
+        .unwrap();
     };
 }
 
 macro_rules! run_read {
     ($buffer:expr) => {
         println!(">>> Read");
+        #[allow(unused_mut)]
         let mut reader = $buffer.reader();
 
         let b = reader.read_u8().unwrap();
@@ -97,6 +101,7 @@ macro_rules! run_empty {
         let mut s = [0u8; 64];
 
         println!(">>> Read empty");
+        #[allow(unused_mut)]
         let mut reader = $buffer.reader();
         assert!(reader.read_u8().is_err());
         assert!(reader.read(&mut s).is_err());
@@ -107,7 +112,7 @@ macro_rules! run_empty {
 macro_rules! run_bound {
     ($buffer:expr, $capacity:expr) => {
         println!(">>> Write bound");
-        let mut writer = $buffer.writer();
+        let writer = $buffer.writer();
 
         for i in 0..$capacity {
             writer.write_u8(i as u8).unwrap();
@@ -128,6 +133,7 @@ macro_rules! run_bound {
 macro_rules! run_siphon {
     ($from:expr, $fcap:expr, $into:expr, $icap:expr) => {
         println!(">>> Write siphon");
+        #[allow(unused_mut)]
         let mut writer = $from.writer();
         for i in 0..$fcap {
             writer.write_u8(i as u8).unwrap();

@@ -1,3 +1,5 @@
+use zenoh_buffers::buffer::Buffer;
+
 //
 // Copyright (c) 2022 ZettaScale Technology
 //
@@ -11,6 +13,8 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+#[cfg(feature = "test")]
+use crate::zenoh::Put;
 use crate::{core::WireExpr, zenoh::PushBody};
 
 pub mod flag {
@@ -48,10 +52,7 @@ pub struct Push {
 }
 
 pub mod ext {
-    use crate::{
-        common::{ZExtZ64, ZExtZBuf},
-        zextz64, zextzbuf,
-    };
+    use crate::{zextz64, zextzbuf};
 
     pub type QoS = zextz64!(0x1, false);
     pub type QoSType = crate::network::ext::QoSType<{ QoS::ID }>;
@@ -64,7 +65,17 @@ pub mod ext {
 }
 
 impl Push {
+    pub fn payload_size(&self) -> usize {
+        match &self.payload {
+            PushBody::Put(p) => {
+                p.payload.len() + p.ext_attachment.as_ref().map_or(0, |a| a.buffer.len())
+            }
+            PushBody::Del(d) => d.ext_attachment.as_ref().map_or(0, |a| a.buffer.len()),
+        }
+    }
+
     #[cfg(feature = "test")]
+    #[doc(hidden)]
     pub fn rand() -> Self {
         use rand::Rng;
 
@@ -82,5 +93,34 @@ impl Push {
             ext_qos,
             ext_nodeid,
         }
+    }
+}
+
+impl From<PushBody> for Push {
+    fn from(value: PushBody) -> Self {
+        Self {
+            wire_expr: WireExpr::empty(),
+            ext_qos: ext::QoSType::DEFAULT,
+            ext_tstamp: None,
+            ext_nodeid: ext::NodeIdType::DEFAULT,
+            payload: value,
+        }
+    }
+}
+
+#[cfg(feature = "test")]
+impl From<Put> for Push {
+    fn from(value: Put) -> Self {
+        PushBody::from(value).into()
+    }
+}
+
+#[cfg(feature = "test")]
+impl From<Vec<u8>> for Push {
+    fn from(value: Vec<u8>) -> Self {
+        Self::from(Put {
+            payload: value.into(),
+            ..Put::default()
+        })
     }
 }

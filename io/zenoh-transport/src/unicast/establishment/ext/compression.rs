@@ -11,9 +11,9 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::unicast::establishment::{AcceptFsm, OpenFsm};
-use async_trait::async_trait;
 use core::marker::PhantomData;
+
+use async_trait::async_trait;
 use zenoh_buffers::{
     reader::{DidntRead, Reader},
     writer::{DidntWrite, Writer},
@@ -22,12 +22,14 @@ use zenoh_codec::{RCodec, WCodec, Zenoh080};
 use zenoh_protocol::transport::{init, open};
 use zenoh_result::Error as ZError;
 
+use crate::unicast::establishment::{AcceptFsm, OpenFsm};
+
 // Extension Fsm
 pub(crate) struct CompressionFsm<'a> {
     _a: PhantomData<&'a ()>,
 }
 
-impl<'a> CompressionFsm<'a> {
+impl CompressionFsm<'_> {
     pub(crate) const fn new() -> Self {
         Self { _a: PhantomData }
     }

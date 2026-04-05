@@ -11,14 +11,18 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::common::batch::{BatchConfig, Decode, Encode, Finalize, RBatch, WBatch};
-use std::fmt;
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
+
 use zenoh_buffers::{BBuf, ZSlice, ZSliceBuffer};
 use zenoh_core::zcondfeat;
 use zenoh_link::{Link, LinkUnicast};
-use zenoh_protocol::transport::{BatchSize, Close, OpenAck, TransportMessage};
+use zenoh_protocol::{
+    core::{Priority, PriorityRange, Reliability},
+    transport::{BatchSize, Close, OpenAck, TransportMessage},
+};
 use zenoh_result::{zerror, ZResult};
+
+use crate::common::batch::{BatchConfig, Decode, Encode, Finalize, RBatch, WBatch};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TransportLinkUnicastDirection {
@@ -26,14 +30,16 @@ pub(crate) enum TransportLinkUnicastDirection {
     Outbound,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct TransportLinkUnicastConfig {
     // Inbound / outbound
     pub(crate) direction: TransportLinkUnicastDirection,
     pub(crate) batch: BatchConfig,
+    pub(crate) priorities: Option<PriorityRange>,
+    pub(crate) reliability: Option<Reliability>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub(crate) struct TransportLinkUnicast {
     pub(crate) link: LinkUnicast,
     pub(crate) config: TransportLinkUnicastConfig,
@@ -54,7 +60,11 @@ impl TransportLinkUnicast {
     }
 
     pub(crate) fn link(&self) -> Link {
-        (&self.link).into()
+        Link::new_unicast(
+            &self.link,
+            self.config.priorities.clone(),
+            self.config.reliability,
+        )
     }
 
     pub(crate) fn tx(&self) -> TransportLinkUnicastTx {
@@ -76,13 +86,13 @@ impl TransportLinkUnicast {
     pub(crate) fn rx(&self) -> TransportLinkUnicastRx {
         TransportLinkUnicastRx {
             link: self.link.clone(),
-            batch: self.config.batch,
+            config: self.config.clone(),
         }
     }
 
     pub(crate) async fn send(&self, msg: &TransportMessage) -> ZResult<usize> {
         let mut link = self.tx();
-        link.send(msg).await
+        link.send(msg, None).await
     }
 
     pub(crate) async fn recv(&self) -> ZResult<TransportMessage> {
@@ -120,34 +130,27 @@ impl fmt::Debug for TransportLinkUnicast {
     }
 }
 
-impl From<&TransportLinkUnicast> for Link {
-    fn from(link: &TransportLinkUnicast) -> Self {
-        Link::from(&link.link)
-    }
-}
-
-impl From<TransportLinkUnicast> for Link {
-    fn from(link: TransportLinkUnicast) -> Self {
-        Link::from(&link.link)
-    }
-}
-
 impl PartialEq<Link> for TransportLinkUnicast {
     fn eq(&self, other: &Link) -> bool {
         &other.src == self.link.get_src() && &other.dst == self.link.get_dst()
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct TransportLinkUnicastTx {
     pub(crate) inner: TransportLinkUnicast,
     pub(crate) buffer: Option<BBuf>,
 }
 
 impl TransportLinkUnicastTx {
-    pub(crate) async fn send_batch(&mut self, batch: &mut WBatch) -> ZResult<()> {
+    pub(crate) async fn send_batch(
+        &mut self,
+        batch: &mut WBatch,
+        priority: Option<Priority>,
+    ) -> ZResult<()> {
         const ERR: &str = "Write error on link: ";
 
-        // log::trace!("WBatch: {:?}", batch);
+        // tracing::trace!("WBatch: {:?}", batch);
 
         let res = batch
             .finalize(self.buffer.as_mut())
@@ -162,22 +165,26 @@ impl TransportLinkUnicastTx {
                 .as_slice(),
         };
 
-        // log::trace!("WBytes: {:02x?}", bytes);
+        // tracing::trace!("WBytes: {:02x?}", bytes);
 
         // Send the message on the link
-        self.inner.link.write_all(bytes).await?;
+        self.inner.link.write_all(bytes, priority).await?;
 
         Ok(())
     }
 
-    pub(crate) async fn send(&mut self, msg: &TransportMessage) -> ZResult<usize> {
+    pub(crate) async fn send(
+        &mut self,
+        msg: &TransportMessage,
+        priority: Option<Priority>,
+    ) -> ZResult<usize> {
         const ERR: &str = "Write error on link: ";
 
         // Create the batch for serializing the message
         let mut batch = WBatch::new(self.inner.config.batch);
         batch.encode(msg).map_err(|_| zerror!("{ERR}{self}"))?;
         let len = batch.len() as usize;
-        self.send_batch(&mut batch).await?;
+        self.send_batch(&mut batch, priority).await?;
         Ok(len)
     }
 }
@@ -198,16 +205,17 @@ impl fmt::Debug for TransportLinkUnicastTx {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct TransportLinkUnicastRx {
     pub(crate) link: LinkUnicast,
-    pub(crate) batch: BatchConfig,
+    pub(crate) config: TransportLinkUnicastConfig,
 }
 
 impl TransportLinkUnicastRx {
-    pub async fn recv_batch<C, T>(&mut self, buff: C) -> ZResult<RBatch>
+    pub async fn recv_batch<C, T>(&mut self, buff: C, priority: Option<Priority>) -> ZResult<RBatch>
     where
         C: Fn() -> T + Copy,
-        T: ZSliceBuffer + 'static,
+        T: AsMut<[u8]> + ZSliceBuffer + 'static,
     {
         const ERR: &str = "Read error from link: ";
 
@@ -215,39 +223,39 @@ impl TransportLinkUnicastRx {
         let end = if self.link.is_streamed() {
             // Read and decode the message length
             let mut len = BatchSize::MIN.to_le_bytes();
-            self.link.read_exact(&mut len).await?;
+            self.link.read_exact(&mut len, priority).await?;
             let l = BatchSize::from_le_bytes(len) as usize;
 
             // Read the bytes
             let slice = into
-                .as_mut_slice()
+                .as_mut()
                 .get_mut(len.len()..len.len() + l)
                 .ok_or_else(|| zerror!("{ERR}{self}. Invalid batch length or buffer size."))?;
-            self.link.read_exact(slice).await?;
+            self.link.read_exact(slice, priority).await?;
             len.len() + l
         } else {
             // Read the bytes
-            self.link.read(into.as_mut_slice()).await?
+            self.link.read(into.as_mut(), priority).await?
         };
 
-        // log::trace!("RBytes: {:02x?}", &into.as_slice()[0..end]);
+        // tracing::trace!("RBytes: {:02x?}", &into.as_slice()[0..end]);
 
-        let buffer = ZSlice::make(Arc::new(into), 0, end)
+        let buffer = ZSlice::new(Arc::new(into), 0, end)
             .map_err(|_| zerror!("{ERR}{self}. ZSlice index(es) out of bounds"))?;
-        let mut batch = RBatch::new(self.batch, buffer);
+        let mut batch = RBatch::new(self.config.batch, buffer);
         batch
             .initialize(buff)
             .map_err(|e| zerror!("{ERR}{self}. {e}."))?;
 
-        // log::trace!("RBatch: {:?}", batch);
+        // tracing::trace!("RBatch: {:?}", batch);
 
         Ok(batch)
     }
 
     pub async fn recv(&mut self) -> ZResult<TransportMessage> {
-        let mtu = self.batch.mtu as usize;
+        let mtu = self.config.batch.mtu as usize;
         let mut batch = self
-            .recv_batch(|| zenoh_buffers::vec::uninit(mtu).into_boxed_slice())
+            .recv_batch(|| zenoh_buffers::vec::uninit(mtu).into_boxed_slice(), None)
             .await?;
         let msg = batch
             .decode()
@@ -258,7 +266,7 @@ impl TransportLinkUnicastRx {
 
 impl fmt::Display for TransportLinkUnicastRx {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{:?}", self.link, self.batch)
+        write!(f, "{}:{:?}", self.link, self.config)
     }
 }
 
@@ -266,7 +274,7 @@ impl fmt::Debug for TransportLinkUnicastRx {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TransportLinkUnicastRx")
             .field("link", &self.link)
-            .field("config", &self.batch)
+            .field("config", &self.config)
             .finish()
     }
 }
@@ -286,7 +294,21 @@ impl MaybeOpenAck {
 
     pub(crate) async fn send_open_ack(mut self) -> ZResult<()> {
         if let Some(msg) = self.open_ack {
-            return self.link.send(&msg.into()).await.map(|_| {});
+            zcondfeat!(
+                "transport_compression",
+                {
+                    // !!! Workaround !!! as the state of the link is set with compression once the OpenSyn is received.
+                    // Here we are disabling the compression just to send the OpenAck (that is not supposed to be compressed).
+                    // Then then we re-enable it, in case it was enabled, after the OpenAck has been sent.
+                    let compression = self.link.inner.config.batch.is_compression;
+                    self.link.inner.config.batch.is_compression = false;
+                    self.link.send(&msg.into(), None).await?;
+                    self.link.inner.config.batch.is_compression = compression;
+                },
+                {
+                    self.link.send(&msg.into(), None).await?;
+                }
+            )
         }
         Ok(())
     }
@@ -296,9 +318,8 @@ impl MaybeOpenAck {
     }
 }
 
-#[derive(PartialEq, Eq)]
 pub(crate) struct LinkUnicastWithOpenAck {
-    link: TransportLinkUnicast,
+    pub(crate) link: TransportLinkUnicast,
     ack: Option<OpenAck>,
 }
 

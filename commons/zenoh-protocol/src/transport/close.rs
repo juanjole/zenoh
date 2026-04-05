@@ -12,11 +12,43 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
+pub mod flag {
+    pub const S: u8 = 1 << 5; // 0x20 Session close if S==1 close the whole session, close only the link otherwise
+                              // pub const X: u8 = 1 << 6; // 0x40       Reserved
+    pub const Z: u8 = 1 << 7; // 0x80 Extensions    if Z==1 then an extension will follow
+}
+
+// Reason for the Close message
+pub mod reason {
+    pub const GENERIC: u8 = 0x00;
+    pub const UNSUPPORTED: u8 = 0x01;
+    pub const INVALID: u8 = 0x02;
+    pub const MAX_SESSIONS: u8 = 0x03;
+    pub const MAX_LINKS: u8 = 0x04;
+    pub const EXPIRED: u8 = 0x05;
+    pub const UNRESPONSIVE: u8 = 0x06;
+    pub const CONNECTION_TO_SELF: u8 = 0x07;
+}
+
+pub fn reason_to_str(reason: u8) -> &'static str {
+    match reason {
+        reason::GENERIC => "GENERIC",
+        reason::UNSUPPORTED => "UNSUPPORTED",
+        reason::INVALID => "INVALID",
+        reason::MAX_SESSIONS => "MAX_SESSIONS",
+        reason::MAX_LINKS => "MAX_LINKS",
+        reason::EXPIRED => "EXPIRED",
+        reason::UNRESPONSIVE => "UNRESPONSIVE",
+        reason::CONNECTION_TO_SELF => "CONNECTION_TO_SELF",
+        _ => "UNKNOWN",
+    }
+}
+
 /// # Close message
 ///
 /// The [`Close`] message is sent in any of the following two cases:
 ///     1) in response to an INIT or OPEN message which are not accepted;
-///     2) at any time to arbitrarly close the transport with the corresponding zenoh node.
+///     2) at any time to arbitrarily close the transport with the corresponding zenoh node.
 ///
 /// The [`Close`] message flow is the following:
 ///
@@ -50,36 +82,7 @@
 ///       the boundary of the serialized messages. The length is encoded as little-endian.
 ///       In any case, the length of a message must not exceed 65535 bytes.
 ///
-
-pub mod flag {
-    pub const S: u8 = 1 << 5; // 0x20 Session close if S==1 close the whole session, close only the link otherwise
-                              // pub const X: u8 = 1 << 6; // 0x40       Reserved
-    pub const Z: u8 = 1 << 7; // 0x80 Extensions    if Z==1 then an extension will follow
-}
-
-// Reason for the Close message
-pub mod reason {
-    pub const GENERIC: u8 = 0x00;
-    pub const UNSUPPORTED: u8 = 0x01;
-    pub const INVALID: u8 = 0x02;
-    pub const MAX_SESSIONS: u8 = 0x03;
-    pub const MAX_LINKS: u8 = 0x04;
-    pub const EXPIRED: u8 = 0x05;
-}
-
-pub fn reason_to_str(reason: u8) -> &'static str {
-    match reason {
-        reason::GENERIC => "GENERIC",
-        reason::UNSUPPORTED => "UNSUPPORTED",
-        reason::INVALID => "INVALID",
-        reason::MAX_SESSIONS => "MAX_SESSIONS",
-        reason::MAX_LINKS => "MAX_LINKS",
-        reason::EXPIRED => "EXPIRED",
-        _ => "UNKNOWN",
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Close {
     pub reason: u8,
     pub session: bool,
@@ -87,6 +90,7 @@ pub struct Close {
 
 impl Close {
     #[cfg(feature = "test")]
+    #[doc(hidden)]
     pub fn rand() -> Self {
         use rand::Rng;
 

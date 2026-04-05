@@ -1,0 +1,70 @@
+#
+# Copyright (c) 2023 ZettaScale Technology
+#
+# This program and the accompanying materials are made available under the
+# terms of the Eclipse Public License 2.0 which is available at
+# http://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+# which is available at https://www.apache.org/licenses/LICENSE-2.0.
+#
+# SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+#
+# Contributors:
+#   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
+#
+[package]
+authors = ["Julien Enoch <julien@enoch.fr>", "kydos <angelo@icorsaro.net>"]
+categories = { workspace = true }
+description = "Internal crate for zenoh"
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+name = "zenoh-ext-examples"
+publish = false
+repository = { workspace = true }
+rust-version = { workspace = true }
+version = { workspace = true }
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+[features]
+default = ["zenoh-examples/default", "zenoh-ext/default", "zenoh/default"]
+unstable = []
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+futures = { workspace = true }
+tokio = { workspace = true, features = [
+  "io-std",
+  "macros",
+  "rt",
+  "sync",
+  "time",
+] }
+zenoh = { workspace = true, default-features = false }
+zenoh-examples = { workspace = true, default-features = false }
+zenoh-ext = { workspace = true, default-features = false, features = [
+  "unstable",
+] }
+
+[dev-dependencies]
+zenoh-config = { workspace = true }
+
+[[example]]
+name = "z_advanced_pub"
+path = "examples/z_advanced_pub.rs"
+
+[[example]]
+name = "z_advanced_sub"
+path = "examples/z_advanced_sub.rs"
+
+[[example]]
+name = "z_member"
+path = "examples/z_member.rs"
+
+[[example]]
+name = "z_view_size"
+path = "examples/z_view_size.rs"
+
+[package.metadata.docs.rs]
+features = ["unstable"]
