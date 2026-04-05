@@ -11,42 +11,38 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use super::transport::TransportUnicastLowlatency;
 use zenoh_protocol::{
-    network::NetworkMessage,
-    transport::{TransportBodyLowLatency, TransportMessageLowLatency},
+    network::{NetworkMessageExt, NetworkMessageMut},
+    transport::{TransportBodyLowLatencyRef, TransportMessageLowLatencyRef},
 };
-#[cfg(feature = "shared-memory")]
-use zenoh_result::bail;
 use zenoh_result::ZResult;
+
+use super::transport::TransportUnicastLowlatency;
+#[cfg(feature = "shared-memory")]
+use crate::shm::map_zmsg_to_partner;
 
 impl TransportUnicastLowlatency {
     #[allow(unused_mut)] // When feature "shared-memory" is not enabled
     #[allow(clippy::let_and_return)] // When feature "stats" is not enabled
     #[inline(always)]
-    pub(crate) fn internal_schedule(&self, mut msg: NetworkMessage) -> ZResult<()> {
+    pub(crate) fn internal_schedule(&self, mut msg: NetworkMessageMut) -> ZResult<()> {
         #[cfg(feature = "shared-memory")]
-        {
-            let res = if self.config.is_shm {
-                crate::shm::map_zmsg_to_shminfo(&mut msg)
-            } else {
-                crate::shm::map_zmsg_to_shmbuf(&mut msg, &self.manager.shm().reader)
-            };
-            if let Err(e) = res {
-                bail!("Failed SHM conversion: {}", e);
-            }
+        if let Some(shm_context) = &self.shm_context {
+            map_zmsg_to_partner(&mut msg, &shm_context.shm_config, &shm_context.shm_provider);
         }
 
-        let msg = TransportMessageLowLatency {
-            body: TransportBodyLowLatency::Network(msg),
+        let msg = msg.as_ref();
+        let tmsg = TransportMessageLowLatencyRef {
+            body: TransportBodyLowLatencyRef::Network(msg),
         };
-        let res = self.send(msg);
+        let res = self.send(tmsg);
 
         #[cfg(feature = "stats")]
         if res.is_ok() {
-            self.stats.inc_tx_n_msgs(1);
-        } else {
-            self.stats.inc_tx_n_dropped(1);
+            self.link_stats
+                .get()
+                .unwrap()
+                .inc_network_message(zenoh_stats::Rx, msg);
         }
 
         res

@@ -11,34 +11,37 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use super::transport::TransportUnicastLowlatency;
 #[cfg(feature = "stats")]
-use crate::stats::TransportStats;
-use crate::unicast::link::TransportLinkUnicastRx;
-use crate::{unicast::link::TransportLinkUnicast, TransportExecutor};
-use async_std::task;
-use async_std::{prelude::FutureExt, sync::RwLock};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::{sync::Arc, time::Duration};
+
+use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use zenoh_buffers::{writer::HasWriter, ZSlice};
 use zenoh_codec::*;
 use zenoh_core::{zasyncread, zasyncwrite};
-use zenoh_protocol::transport::{KeepAlive, TransportBodyLowLatency, TransportMessageLowLatency};
+use zenoh_link::LinkUnicast;
+use zenoh_protocol::transport::{
+    KeepAlive, TransportBodyLowLatencyRef, TransportMessageLowLatencyRef,
+};
 use zenoh_result::{zerror, ZResult};
-use zenoh_sync::RecyclingObjectPool;
+use zenoh_runtime::ZRuntime;
+
+use super::transport::TransportUnicastLowlatency;
+use crate::unicast::link::{TransportLinkUnicast, TransportLinkUnicastRx};
 
 pub(crate) async fn send_with_link(
-    link: &TransportLinkUnicast,
-    msg: TransportMessageLowLatency,
-    #[cfg(feature = "stats")] stats: &Arc<TransportStats>,
+    link: &LinkUnicast,
+    msg: TransportMessageLowLatencyRef<'_>,
+    #[cfg(feature = "stats")] stats: &zenoh_stats::LinkStats,
 ) -> ZResult<()> {
     let len;
-    if link.link.is_streamed() {
+    let codec = Zenoh080::new();
+    if link.is_streamed() {
         let mut buffer = vec![0, 0, 0, 0];
-        let codec = Zenoh080::new();
         let mut writer = buffer.writer();
         codec
-            .write(&mut writer, &msg)
+            .write(&mut writer, msg)
             .map_err(|_| zerror!("Error serializing message {:?}", msg))?;
 
         len = (buffer.len() - 4) as u32;
@@ -46,128 +49,176 @@ pub(crate) async fn send_with_link(
 
         buffer[0..4].copy_from_slice(&le);
 
-        link.link.write_all(&buffer).await?;
+        link.write_all(&buffer, None).await?;
     } else {
         let mut buffer = vec![];
-        let codec = Zenoh080::new();
         let mut writer = buffer.writer();
         codec
-            .write(&mut writer, &msg)
+            .write(&mut writer, msg)
             .map_err(|_| zerror!("Error serializing message {:?}", msg))?;
 
         #[cfg(feature = "stats")]
         {
             len = buffer.len() as u32;
         }
-        link.link.write_all(&buffer).await?;
+        link.write_all(&buffer, None).await?;
     }
-    log::trace!("Sent: {:?}", msg);
+    tracing::trace!("Sent: {:?}", msg);
 
     #[cfg(feature = "stats")]
     {
-        stats.inc_tx_t_msgs(1);
-        stats.inc_tx_bytes(len as usize);
+        stats.inc_bytes(zenoh_stats::Tx, len as u64);
+        stats.inc_transport_message(zenoh_stats::Tx, 1);
     }
     Ok(())
 }
 
+pub(crate) async fn read_with_link(
+    link: &TransportLinkUnicastRx,
+    buffer: &mut [u8],
+    is_streamed: bool,
+) -> ZResult<usize> {
+    if is_streamed {
+        // 16 bits for reading the batch length
+        let mut length = [0_u8; 4];
+        link.link.read_exact(&mut length, None).await?;
+        let n = u32::from_le_bytes(length) as usize;
+        let len = buffer.len();
+        let b = buffer.get_mut(0..n).ok_or_else(|| {
+            zerror!("Batch len is invalid. Received {n} but negotiated max len is {len}.")
+        })?;
+        link.link.read_exact(b, None).await?;
+        Ok(n)
+    } else {
+        link.link.read(buffer, None).await
+    }
+}
+
 impl TransportUnicastLowlatency {
-    pub(super) fn send(&self, msg: TransportMessageLowLatency) -> ZResult<()> {
-        async_std::task::block_on(self.send_async(msg))
+    pub(super) fn send(&self, msg: TransportMessageLowLatencyRef) -> ZResult<()> {
+        zenoh_runtime::ZRuntime::TX.block_in_place(self.send_async(msg))
     }
 
-    pub(super) async fn send_async(&self, msg: TransportMessageLowLatency) -> ZResult<()> {
+    pub(super) async fn send_async(&self, msg: TransportMessageLowLatencyRef<'_>) -> ZResult<()> {
         let guard = zasyncwrite!(self.link);
-        let link = guard.as_ref().ok_or_else(|| zerror!("No link"))?;
+        let link = &guard.as_ref().ok_or_else(|| zerror!("No link"))?.link;
         send_with_link(
             link,
             msg,
             #[cfg(feature = "stats")]
-            &self.stats,
+            self.link_stats.get().unwrap(),
         )
         .await
     }
 
-    pub(super) fn start_keepalive(&self, executor: &TransportExecutor, keep_alive: Duration) {
-        let mut guard = async_std::task::block_on(async { zasyncwrite!(self.handle_keepalive) });
+    pub(super) fn start_keepalive(&self, keep_alive: Duration) {
         let c_transport = self.clone();
-        let handle = executor.spawn(async move {
+        let token = self.token.child_token();
+        let task = async move {
             let res = keepalive_task(
                 c_transport.link.clone(),
                 keep_alive,
+                token,
                 #[cfg(feature = "stats")]
-                c_transport.stats.clone(),
+                c_transport.link_stats.clone(),
             )
             .await;
-            log::debug!(
+            tracing::debug!(
                 "[{}] Keepalive task finished with result {:?}",
                 c_transport.manager.config.zid,
                 res
             );
             if res.is_err() {
-                log::debug!(
+                tracing::debug!(
                     "[{}] <on keepalive exit> finalizing transport with peer: {}",
                     c_transport.manager.config.zid,
                     c_transport.config.zid
                 );
-                let _ = c_transport.finalize(0).await;
+
+                // Spawn a task to avoid a deadlock waiting for this same task
+                // to finish in the close() joining its handle
+                // WARN: Must be spawned on RX
+                zenoh_runtime::ZRuntime::RX.spawn(async move { c_transport.finalize(0).await });
             }
-        });
-        *guard = Some(handle);
-    }
-
-    pub(super) async fn stop_keepalive(&self) {
-        let zid = self.manager.config.zid;
-        log::debug!("[{}] Stopping keepalive task...", zid,);
-        let mut guard = zasyncwrite!(self.handle_keepalive);
-        let handle = guard.take();
-        drop(guard);
-
-        if let Some(handle) = handle {
-            let _ = handle.cancel().await;
-            log::debug!("[{}] keepalive task stopped...", zid,);
-        }
+        };
+        self.tracker.spawn_on(task, &ZRuntime::TX);
     }
 
     pub(super) fn internal_start_rx(&self, lease: Duration) {
-        let mut guard = async_std::task::block_on(async { zasyncwrite!(self.handle_rx) });
+        let rx_buffer_size = self.manager.config.link_rx_buffer_size;
+        let token = self.token.child_token();
+
         let c_transport = self.clone();
-        let handle = task::spawn(async move {
+        let rx_task = async move {
             let guard = zasyncread!(c_transport.link);
-            let link = guard.as_ref().unwrap().rx();
+            let link_rx = guard.as_ref().unwrap().rx();
             drop(guard);
-            let rx_buffer_size = c_transport.manager.config.link_rx_buffer_size;
+            #[cfg(feature = "stats")]
+            let stats = c_transport.link_stats.get().unwrap();
 
-            // Start the rx task
-            let res = rx_task(link, c_transport.clone(), lease, rx_buffer_size).await;
-            log::debug!(
-                "[{}] Rx task finished with result {:?}",
-                c_transport.manager.config.zid,
-                res
-            );
-            if res.is_err() {
-                log::debug!(
-                    "[{}] <on rx exit> finalizing transport with peer: {}",
-                    c_transport.manager.config.zid,
-                    c_transport.config.zid
-                );
-                let _ = c_transport.finalize(0).await;
+            let is_streamed = link_rx.link.is_streamed();
+
+            // The pool of buffers
+            let pool = {
+                let mtu = link_rx.config.batch.mtu as usize;
+                let mut n = rx_buffer_size / mtu;
+                if n == 0 {
+                    tracing::debug!("RX configured buffer of {rx_buffer_size} bytes is too small for {link_rx} that has an MTU of {mtu} bytes. Defaulting to {mtu} bytes for RX buffer.");
+                    n = 1;
+                }
+                zenoh_sync::RecyclingObjectPool::new(n, move || vec![0_u8; mtu].into_boxed_slice())
+            };
+
+            loop {
+                // Retrieve one buffer
+                let mut buffer = pool.try_take().unwrap_or_else(|| pool.alloc());
+
+                tokio::select! {
+                    // Async read from the underlying link
+                    res = tokio::time::timeout(lease, read_with_link(&link_rx, &mut buffer, is_streamed)) => {
+                        let bytes = res.map_err(|_| zerror!("{}: expired after {} milliseconds", link_rx, lease.as_millis()))??;
+
+                        #[cfg(feature = "stats")] {
+                            let header_bytes = if is_streamed { 2 } else { 0 };
+                            stats.inc_bytes(zenoh_stats::Tx, header_bytes + bytes as u64)
+                        }
+
+                        // Deserialize all the messages from the current ZBuf
+                        let zslice = ZSlice::new(Arc::new(buffer), 0, bytes).unwrap();
+                        c_transport.read_messages(zslice, &link_rx.link, #[cfg(feature = "stats")] stats).await?;
+                    }
+
+                    _ = token.cancelled() => {
+                        break ZResult::Ok(());
+                    }
+                }
             }
-        });
-        *guard = Some(handle);
-    }
+        };
 
-    pub(super) async fn stop_rx(&self) {
-        let zid = self.manager.config.zid;
-        log::debug!("[{}] Stopping rx task...", zid,);
-        let mut guard = zasyncwrite!(self.handle_rx);
-        let handle = guard.take();
-        drop(guard);
+        let c_transport = self.clone();
+        self.tracker.spawn_on(
+            async move {
+                let res = rx_task.await;
+                tracing::debug!(
+                    "[{}] Rx task finished with result {:?}",
+                    c_transport.manager.config.zid,
+                    res
+                );
+                if res.is_err() {
+                    tracing::debug!(
+                        "[{}] <on rx exit> finalizing transport with peer: {}",
+                        c_transport.manager.config.zid,
+                        c_transport.config.zid
+                    );
 
-        if let Some(handle) = handle {
-            let _ = handle.cancel().await;
-            log::debug!("[{}] rx task stopped...", zid,);
-        }
+                    // Spawn a task to avoid a deadlock waiting for this same task
+                    // to finish in the close() joining its handle
+                    // WARN: Must be spawned on RX
+                    zenoh_runtime::ZRuntime::RX.spawn(async move { c_transport.finalize(0).await });
+                }
+            },
+            &ZRuntime::RX,
+        );
     }
 }
 
@@ -177,117 +228,33 @@ impl TransportUnicastLowlatency {
 async fn keepalive_task(
     link: Arc<RwLock<Option<TransportLinkUnicast>>>,
     keep_alive: Duration,
-    #[cfg(feature = "stats")] stats: Arc<TransportStats>,
+    token: CancellationToken,
+    #[cfg(feature = "stats")] stats: Arc<OnceLock<zenoh_stats::LinkStats>>,
 ) -> ZResult<()> {
+    let mut interval =
+        tokio::time::interval_at(tokio::time::Instant::now() + keep_alive, keep_alive);
+
     loop {
-        async_std::task::sleep(keep_alive).await;
+        tokio::select! {
+            _ = interval.tick() => {
+                let keepailve = TransportMessageLowLatencyRef {
+                    body: TransportBodyLowLatencyRef::KeepAlive(KeepAlive),
+                };
 
-        let keepailve = TransportMessageLowLatency {
-            body: TransportBodyLowLatency::KeepAlive(KeepAlive),
-        };
+                let guard = zasyncwrite!(link);
+                let link = &guard.as_ref().ok_or_else(|| zerror!("No link"))?.link;
+                let _ = send_with_link(
+                    link,
+                    keepailve,
+                    #[cfg(feature = "stats")]
+                    stats.get().unwrap(),
+                )
+                .await;
+                drop(guard);
+            }
 
-        let guard = zasyncwrite!(link);
-        let link = guard.as_ref().ok_or_else(|| zerror!("No link"))?;
-        let _ = send_with_link(
-            link,
-            keepailve,
-            #[cfg(feature = "stats")]
-            &stats,
-        )
-        .await;
-        drop(guard);
+            _ = token.cancelled() => break,
+        }
     }
-}
-
-async fn rx_task_stream(
-    link: TransportLinkUnicastRx,
-    transport: TransportUnicastLowlatency,
-    lease: Duration,
-    rx_buffer_size: usize,
-) -> ZResult<()> {
-    async fn read(link: &TransportLinkUnicastRx, buffer: &mut [u8]) -> ZResult<usize> {
-        // 16 bits for reading the batch length
-        let mut length = [0_u8, 0_u8, 0_u8, 0_u8];
-        link.link.read_exact(&mut length).await?;
-        let n = u32::from_le_bytes(length) as usize;
-        let len = buffer.len();
-        let b = buffer.get_mut(0..n).ok_or_else(|| {
-            zerror!("Batch len is invalid. Received {n} but negotiated max len is {len}.")
-        })?;
-        link.link.read_exact(b).await?;
-        Ok(n)
-    }
-
-    // The pool of buffers
-    let mtu = link.batch.mtu as usize;
-    let mut n = rx_buffer_size / mtu;
-    if rx_buffer_size % mtu != 0 {
-        n += 1;
-    }
-
-    let pool = RecyclingObjectPool::new(n, || vec![0_u8; mtu].into_boxed_slice());
-    loop {
-        // Retrieve one buffer
-        let mut buffer = pool.try_take().unwrap_or_else(|| pool.alloc());
-
-        // Async read from the underlying link
-        let bytes = read(&link, &mut buffer)
-            .timeout(lease)
-            .await
-            .map_err(|_| zerror!("{}: expired after {} milliseconds", link, lease.as_millis()))??;
-        #[cfg(feature = "stats")]
-        transport.stats.inc_rx_bytes(2 + bytes); // Account for the batch len encoding (16 bits)
-
-        // Deserialize all the messages from the current ZBuf
-        let zslice = ZSlice::make(Arc::new(buffer), 0, bytes).unwrap();
-        transport.read_messages(zslice, &link.link).await?;
-    }
-}
-
-async fn rx_task_dgram(
-    link: TransportLinkUnicastRx,
-    transport: TransportUnicastLowlatency,
-    lease: Duration,
-    rx_buffer_size: usize,
-) -> ZResult<()> {
-    // The pool of buffers
-    let mtu = link.batch.max_buffer_size();
-    let mut n = rx_buffer_size / mtu;
-    if rx_buffer_size % mtu != 0 {
-        n += 1;
-    }
-
-    let pool = RecyclingObjectPool::new(n, || vec![0_u8; mtu].into_boxed_slice());
-    loop {
-        // Retrieve one buffer
-        let mut buffer = pool.try_take().unwrap_or_else(|| pool.alloc());
-
-        // Async read from the underlying link
-        let bytes = link
-            .link
-            .read(&mut buffer)
-            .timeout(lease)
-            .await
-            .map_err(|_| zerror!("{}: expired after {} milliseconds", link, lease.as_millis()))??;
-
-        #[cfg(feature = "stats")]
-        transport.stats.inc_rx_bytes(bytes);
-
-        // Deserialize all the messages from the current ZBuf
-        let zslice = ZSlice::make(Arc::new(buffer), 0, bytes).unwrap();
-        transport.read_messages(zslice, &link.link).await?;
-    }
-}
-
-async fn rx_task(
-    link: TransportLinkUnicastRx,
-    transport: TransportUnicastLowlatency,
-    lease: Duration,
-    rx_buffer_size: usize,
-) -> ZResult<()> {
-    if link.link.is_streamed() {
-        rx_task_stream(link, transport, lease, rx_buffer_size).await
-    } else {
-        rx_task_dgram(link, transport, lease, rx_buffer_size).await
-    }
+    Ok(())
 }

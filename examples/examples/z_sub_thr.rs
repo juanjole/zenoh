@@ -11,11 +11,10 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use clap::Parser;
-use std::io::{stdin, Read};
 use std::time::Instant;
-use zenoh::config::Config;
-use zenoh::prelude::sync::*;
+
+use clap::Parser;
+use zenoh::{Config, Wait};
 use zenoh_examples::CommonArgs;
 
 struct Stats {
@@ -52,36 +51,34 @@ impl Stats {
     }
     fn print_round(&self) {
         let elapsed = self.round_start.elapsed().as_secs_f64();
-        let throughtput = (self.round_size as f64) / elapsed;
-        println!("{throughtput} msg/s");
+        let throughput = (self.round_size as f64) / elapsed;
+        println!("{throughput} msg/s");
     }
 }
 impl Drop for Stats {
     fn drop(&mut self) {
-        let elapsed = self.global_start.unwrap().elapsed().as_secs_f64();
+        let Some(global_start) = self.global_start else {
+            return;
+        };
+        let elapsed = global_start.elapsed().as_secs_f64();
         let total = self.round_size * self.finished_rounds + self.round_count;
-        let throughtput = total as f64 / elapsed;
-        println!("Received {total} messages over {elapsed:.2}s: {throughtput}msg/s");
+        let throughput = total as f64 / elapsed;
+        println!("Received {total} messages over {elapsed:.2}s: {throughput}msg/s");
     }
 }
 
 fn main() {
     // initiate logging
-    env_logger::init();
+    zenoh::init_log_from_env_or("error");
 
-    let (mut config, m, n) = parse_args();
+    let (config, m, n) = parse_args();
 
-    // A probing procedure for shared memory is performed upon session opening. To enable `z_pub_shm_thr` to operate
-    // over shared memory (and to not fallback on network mode), shared memory needs to be enabled also on the
-    // subscriber side. By doing so, the probing procedure will succeed and shared memory will operate as expected.
-    config.transport.shared_memory.set_enabled(true).unwrap();
-
-    let session = zenoh::open(config).res().unwrap();
+    let session = zenoh::open(config).wait().unwrap();
 
     let key_expr = "test/thr";
 
     let mut stats = Stats::new(n);
-    let _sub = session
+    session
         .declare_subscriber(key_expr)
         .callback_mut(move |_sample| {
             stats.increment();
@@ -89,15 +86,12 @@ fn main() {
                 std::process::exit(0)
             }
         })
-        .res()
+        .background()
+        .wait()
         .unwrap();
 
-    for byte in stdin().bytes() {
-        match byte {
-            Ok(b'q') => break,
-            _ => std::thread::yield_now(),
-        }
-    }
+    println!("Press CTRL-C to quit...");
+    std::thread::park();
 }
 
 #[derive(clap::Parser, Clone, PartialEq, Eq, Hash, Debug)]

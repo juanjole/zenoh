@@ -16,12 +16,17 @@
 //!
 //! This crate is intended for Zenoh's internal use.
 //!
-//! [Click here for Zenoh's documentation](../zenoh/index.html)
+//! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
 pub mod single_or_vec;
-pub use single_or_vec::*;
+pub use single_or_vec::SingleOrVec;
+
+#[cfg(feature = "std")]
+pub mod single_or_box_hashset;
+#[cfg(feature = "std")]
+pub use single_or_box_hashset::SingleOrBoxHashSet;
 
 #[cfg(feature = "std")]
 pub mod ring_buffer;
@@ -34,6 +39,6 @@ pub mod stack_buffer;
 pub use stack_buffer::*;
 
 #[cfg(feature = "std")]
-pub mod properties;
+pub mod int_hash_map;
 #[cfg(feature = "std")]
-pub use properties::*;
+pub use int_hash_map::*;

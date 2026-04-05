@@ -11,72 +11,57 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use async_std::task::sleep;
 use clap::Parser;
-use futures::prelude::*;
-use futures::select;
-use std::time::Duration;
-use zenoh::config::Config;
-use zenoh::prelude::r#async::*;
+use zenoh::{key_expr::KeyExpr, sample::SampleKind, Config};
 use zenoh_examples::CommonArgs;
 
-#[async_std::main]
+#[tokio::main]
 async fn main() {
     // Initiate logging
-    env_logger::init();
+    zenoh::init_log_from_env_or("error");
 
-    let (config, key_expr) = parse_args();
+    let (config, key_expr, history) = parse_args();
 
     println!("Opening session...");
-    let session = zenoh::open(config).res().await.unwrap();
+    let session = zenoh::open(config).await.unwrap();
 
     println!("Declaring Liveliness Subscriber on '{}'...", &key_expr);
 
     let subscriber = session
         .liveliness()
         .declare_subscriber(&key_expr)
-        .res()
+        .history(history)
         .await
         .unwrap();
 
-    println!("Enter 'q' to quit...");
-    let mut stdin = async_std::io::stdin();
-    let mut input = [0_u8];
-    loop {
-        select!(
-            sample = subscriber.recv_async() => {
-                let sample = sample.unwrap();
-                match sample.kind {
-                    SampleKind::Put => println!(
-                        ">> [LivelinessSubscriber] New alive token ('{}')",
-                        sample.key_expr.as_str()),
-                    SampleKind::Delete => println!(
-                        ">> [LivelinessSubscriber] Dropped token ('{}')",
-                        sample.key_expr.as_str()),
-                }
-            },
-
-            _ = stdin.read_exact(&mut input).fuse() => {
-                match input[0] {
-                    b'q' => break,
-                    0 => sleep(Duration::from_secs(1)).await,
-                    _ => (),
-                }
-            }
-        );
+    println!("Press CTRL-C to quit...");
+    while let Ok(sample) = subscriber.recv_async().await {
+        match sample.kind() {
+            SampleKind::Put => println!(
+                ">> [LivelinessSubscriber] New alive token ('{}')",
+                sample.key_expr().as_str()
+            ),
+            SampleKind::Delete => println!(
+                ">> [LivelinessSubscriber] Dropped token ('{}')",
+                sample.key_expr().as_str()
+            ),
+        }
     }
 }
 
 #[derive(clap::Parser, Clone, PartialEq, Eq, Hash, Debug)]
 struct Args {
     #[arg(short, long, default_value = "group1/**")]
-    /// The key expression to write to.
+    /// The key expression to subscribe to.
     key: KeyExpr<'static>,
+    #[arg(long)]
+    /// Get historical liveliness tokens.
+    history: bool,
     #[command(flatten)]
     common: CommonArgs,
 }
 
-fn parse_args() -> (Config, KeyExpr<'static>) {
+fn parse_args() -> (Config, KeyExpr<'static>, bool) {
     let args = Args::parse();
-    (args.common.into(), args.key)
+    (args.common.into(), args.key, args.history)
 }

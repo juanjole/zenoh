@@ -11,18 +11,19 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::{
-    buffer::{Buffer, SplitBuffer},
-    reader::{BacktrackableReader, DidntRead, DidntSiphon, HasReader, Reader, SiphonableReader},
-    writer::{BacktrackableWriter, DidntWrite, HasWriter, Writer},
-    ZSlice,
-};
 use core::{
     marker::PhantomData,
     mem,
     num::NonZeroUsize,
     option,
     slice::{self},
+};
+
+use crate::{
+    buffer::{Buffer, SplitBuffer},
+    reader::{BacktrackableReader, DidntRead, DidntSiphon, HasReader, Reader, SiphonableReader},
+    writer::{BacktrackableWriter, DidntWrite, HasWriter, Writer},
+    ZBuf, ZSlice,
 };
 
 // Buffer
@@ -42,7 +43,10 @@ impl Buffer for &mut [u8] {
 
 // SplitBuffer
 impl<'b> SplitBuffer for &'b [u8] {
-    type Slices<'a> = option::IntoIter<&'a [u8]> where 'b: 'a;
+    type Slices<'a>
+        = option::IntoIter<&'a [u8]>
+    where
+        'b: 'a;
 
     fn slices(&self) -> Self::Slices<'_> {
         Some(*self).into_iter()
@@ -59,47 +63,24 @@ impl HasWriter for &mut [u8] {
 }
 
 impl Writer for &mut [u8] {
+    #[inline(always)]
     fn write(&mut self, bytes: &[u8]) -> Result<NonZeroUsize, DidntWrite> {
-        let len = bytes.len().min(self.len());
-        if len == 0 {
+        let Some(len) = NonZeroUsize::new(bytes.len().min(self.len())) else {
             return Err(DidntWrite);
-        }
-
-        // SAFETY: len is guaranteed to be the minimum between lhs and rhs length.
-        //         We early return if length is 0.
-        let lhs = crate::unsafe_slice_mut!(self, ..len);
-        let rhs = crate::unsafe_slice!(bytes, ..len);
-        lhs.copy_from_slice(rhs);
-
-        // SAFETY: len is guaranteed to be the minimum between lhs and rhs length.
-        let lhs = crate::unsafe_slice_mut!(self, len..);
-        // SAFETY: this doesn't compile with simple assignment because the compiler
-        // doesn't believe that the subslice has the same lifetime as the original slice,
-        // so we transmute to assure it that it does.
-        *self = unsafe { mem::transmute(lhs) };
-
-        // SAFETY: this operation is safe since we check if len is non-zero.
-        Ok(unsafe { NonZeroUsize::new_unchecked(len) })
+        };
+        let (to_write, remain) = mem::take(self).split_at_mut(len.get());
+        to_write.copy_from_slice(&bytes[..len.get()]);
+        *self = remain;
+        Ok(len)
     }
 
+    #[inline(always)]
     fn write_exact(&mut self, bytes: &[u8]) -> Result<(), DidntWrite> {
         let len = bytes.len();
         if self.len() < len {
             return Err(DidntWrite);
         }
-
-        // SAFETY: len is guaranteed to be the smaller than lhs length.
-        let lhs = crate::unsafe_slice_mut!(self, ..len);
-        let rhs = crate::unsafe_slice!(bytes, ..len);
-        lhs.copy_from_slice(rhs);
-
-        // SAFETY: len is guaranteed to be the minimum between lhs and rhs length.
-        let lhs = crate::unsafe_slice_mut!(self, len..);
-        // SAFETY: this doesn't compile with simple assignment because the compiler
-        // doesn't believe that the subslice has the same lifetime as the original slice,
-        // so we transmute to assure it that it does.
-        *self = unsafe { mem::transmute(lhs) };
-
+        let _ = self.write(bytes);
         Ok(())
     }
 
@@ -107,24 +88,21 @@ impl Writer for &mut [u8] {
         self.len()
     }
 
-    fn with_slot<F>(&mut self, mut len: usize, f: F) -> Result<NonZeroUsize, DidntWrite>
+    /// # Safety
+    ///
+    /// The `write` closure must return the number of bytes actually written to the slice,
+    /// which must be less than or equal to `len`.
+    unsafe fn with_slot<F>(&mut self, len: usize, write: F) -> Result<NonZeroUsize, DidntWrite>
     where
         F: FnOnce(&mut [u8]) -> usize,
     {
         if len > self.len() {
             return Err(DidntWrite);
         }
-        // SAFETY: we early return in case len is greater than slice.len().
-        let s = crate::unsafe_slice_mut!(self, ..len);
-        len = f(s);
-        // SAFETY: we early return in case len is greater than slice.len().
-        let s = crate::unsafe_slice_mut!(self, len..);
-        // SAFETY: this doesn't compile with simple assignment because the compiler
-        // doesn't believe that the subslice has the same lifetime as the original slice,
-        // so we transmute to assure it that it does.
-        *self = unsafe { mem::transmute(s) };
-
-        NonZeroUsize::new(len).ok_or(DidntWrite)
+        let written = write(&mut self[..len]);
+        // SAFETY: `written` <= `len` is guaranteed by the safety contract of this function.
+        *self = unsafe { mem::take(self).get_unchecked_mut(written..) };
+        NonZeroUsize::new(written).ok_or(DidntWrite)
     }
 }
 
@@ -147,14 +125,15 @@ impl<'s> BacktrackableWriter for &'s mut [u8] {
     }
 
     fn rewind(&mut self, mark: Self::Mark) -> bool {
-        // SAFETY: SliceMark's lifetime is bound to the slice's lifetime
+        // SAFETY: SliceMark's lifetime is bound to the slice's lifetime, and the pointer and length
+        // are guaranteed to be valid as they were obtained from a valid slice in `mark()`.
         *self = unsafe { slice::from_raw_parts_mut(mark.ptr as *mut u8, mark.len) };
         true
     }
 }
 
 // Reader
-impl<'a> HasReader for &'a [u8] {
+impl HasReader for &[u8] {
     type Reader = Self;
 
     fn reader(self) -> Self::Reader {
@@ -163,40 +142,35 @@ impl<'a> HasReader for &'a [u8] {
 }
 
 impl Reader for &[u8] {
+    #[inline(always)]
     fn read(&mut self, into: &mut [u8]) -> Result<NonZeroUsize, DidntRead> {
-        let len = self.len().min(into.len());
-        // SAFETY: len is guaranteed to be the smaller than lhs length.
-        let lhs = crate::unsafe_slice_mut!(into, ..len);
-        let rhs = crate::unsafe_slice!(self, ..len);
-        lhs.copy_from_slice(rhs);
-        // SAFETY: len is guaranteed to be smaller than slice.len().
-        *self = crate::unsafe_slice!(self, len..);
-        NonZeroUsize::new(len).ok_or(DidntRead)
+        let Some(len) = NonZeroUsize::new(self.len().min(into.len())) else {
+            return Err(DidntRead);
+        };
+        let (to_write, remain) = self.split_at(len.get());
+        into[..len.get()].copy_from_slice(to_write);
+        *self = remain;
+        Ok(len)
     }
 
+    #[inline(always)]
     fn read_exact(&mut self, into: &mut [u8]) -> Result<(), DidntRead> {
         let len = into.len();
         if self.len() < len {
             return Err(DidntRead);
         }
-        // SAFETY: len is guaranteed to be the smaller than lhs length.
-        let lhs = crate::unsafe_slice_mut!(into, ..len);
-        let rhs = crate::unsafe_slice!(self, ..len);
-        lhs.copy_from_slice(rhs);
-        // SAFETY: len is guaranteed to be smaller than slice.len().
-        *self = crate::unsafe_slice!(self, len..);
+        let (to_write, remain) = self.split_at(len);
+        into[..len].copy_from_slice(to_write);
+        *self = remain;
         Ok(())
     }
 
-    fn read_u8(&mut self) -> Result<u8, DidntRead> {
-        if !self.can_read() {
-            return Err(DidntRead);
-        }
-        // SAFETY: we early return in case the slice is empty.
-        //         Therefore, there is at least one element in the slice.
-        let ret = *crate::unsafe_slice!(self, 0);
-        *self = crate::unsafe_slice!(self, 1..);
-        Ok(ret)
+    fn remaining(&self) -> usize {
+        self.len()
+    }
+
+    fn read_zbuf(&mut self, len: usize) -> Result<ZBuf, DidntRead> {
+        Ok(self.read_zslice(len)?.into())
     }
 
     fn read_zslices<F: FnMut(ZSlice)>(&mut self, len: usize, mut f: F) -> Result<(), DidntRead> {
@@ -214,8 +188,11 @@ impl Reader for &[u8] {
         Ok(buffer.into())
     }
 
-    fn remaining(&self) -> usize {
-        self.len()
+    #[inline(always)]
+    fn read_u8(&mut self) -> Result<u8, DidntRead> {
+        let mut buf = [0; 1];
+        self.read(&mut buf)?;
+        Ok(buf[0])
     }
 
     fn can_read(&self) -> bool {
@@ -236,7 +213,7 @@ impl<'a> BacktrackableReader for &'a [u8] {
     }
 }
 
-impl<'a> SiphonableReader for &'a [u8] {
+impl SiphonableReader for &[u8] {
     fn siphon<W>(&mut self, writer: &mut W) -> Result<NonZeroUsize, DidntSiphon>
     where
         W: Writer,

@@ -11,95 +11,58 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+
+use zenoh::{key_expr::KeyExpr, session::Session, Error};
+
+#[allow(deprecated)]
 use super::PublicationCacheBuilder;
-use std::convert::TryInto;
-use std::sync::Arc;
-use zenoh::prelude::KeyExpr;
-use zenoh::{Session, SessionRef};
 
 /// Some extensions to the [`zenoh::Session`](zenoh::Session)
+#[zenoh_macros::unstable]
+#[allow(deprecated)]
 pub trait SessionExt {
-    type PublicationCacheBuilder<'a, 'b, 'c>
-    where
-        Self: 'a;
-    fn declare_publication_cache<'a, 'b, 'c, TryIntoKeyExpr>(
-        &'a self,
-        pub_key_expr: TryIntoKeyExpr,
-    ) -> Self::PublicationCacheBuilder<'a, 'b, 'c>
-    where
-        TryIntoKeyExpr: TryInto<KeyExpr<'b>>,
-        <TryIntoKeyExpr as TryInto<KeyExpr<'b>>>::Error: Into<zenoh_result::Error>;
-}
-
-impl SessionExt for Session {
-    type PublicationCacheBuilder<'a, 'b, 'c> = PublicationCacheBuilder<'a, 'b, 'c>;
+    // REVIEW(fuzzypixelz): this doc test is the only one to use the programmatic configuration API..
+    /// Declare a [`PublicationCache`](crate::PublicationCache).
+    ///
+    /// Examples:
+    /// ```
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// use zenoh_ext::SessionExt;
+    /// use zenoh_config::ModeDependentValue::Unique;
+    ///
+    ///
+    /// let mut config = zenoh::Config::default();
+    /// config.timestamping.set_enabled(Some(Unique(true)));
+    /// let session = zenoh::open(config).await.unwrap();
+    /// let publication_cache = session.declare_publication_cache("key/expression").await.unwrap();
+    /// tokio::task::spawn(async move {
+    ///     publication_cache.key_expr();
+    /// }).await;
+    /// # }
+    /// ```
+    #[deprecated = "Use `AdvancedPublisher` and `AdvancedSubscriber` instead."]
+    #[zenoh_macros::unstable]
     fn declare_publication_cache<'a, 'b, 'c, TryIntoKeyExpr>(
         &'a self,
         pub_key_expr: TryIntoKeyExpr,
     ) -> PublicationCacheBuilder<'a, 'b, 'c>
     where
         TryIntoKeyExpr: TryInto<KeyExpr<'b>>,
-        <TryIntoKeyExpr as TryInto<KeyExpr<'b>>>::Error: Into<zenoh_result::Error>,
-    {
-        PublicationCacheBuilder::new(
-            SessionRef::Borrow(self),
-            pub_key_expr.try_into().map_err(Into::into),
-        )
-    }
+        <TryIntoKeyExpr as TryInto<KeyExpr<'b>>>::Error: Into<Error>;
 }
 
-impl<T: ArcSessionExt + 'static> SessionExt for T {
-    type PublicationCacheBuilder<'a, 'b, 'c> = PublicationCacheBuilder<'static, 'b, 'c>;
+#[allow(deprecated)]
+impl SessionExt for Session {
+    #[zenoh_macros::unstable]
     fn declare_publication_cache<'a, 'b, 'c, TryIntoKeyExpr>(
         &'a self,
         pub_key_expr: TryIntoKeyExpr,
-    ) -> Self::PublicationCacheBuilder<'a, 'b, 'c>
+    ) -> PublicationCacheBuilder<'a, 'b, 'c>
     where
         TryIntoKeyExpr: TryInto<KeyExpr<'b>>,
-        <TryIntoKeyExpr as TryInto<KeyExpr<'b>>>::Error: Into<zenoh_result::Error>,
+        <TryIntoKeyExpr as TryInto<KeyExpr<'b>>>::Error: Into<Error>,
     {
-        ArcSessionExt::declare_publication_cache(self, pub_key_expr)
-    }
-}
-
-pub trait ArcSessionExt {
-    fn declare_publication_cache<'b, 'c, TryIntoKeyExpr>(
-        &self,
-        pub_key_expr: TryIntoKeyExpr,
-    ) -> PublicationCacheBuilder<'static, 'b, 'c>
-    where
-        TryIntoKeyExpr: TryInto<KeyExpr<'b>>,
-        <TryIntoKeyExpr as TryInto<KeyExpr<'b>>>::Error: Into<zenoh_result::Error>;
-}
-
-impl ArcSessionExt for Arc<Session> {
-    /// Examples:
-    /// ```
-    /// # async_std::task::block_on(async {
-    /// use zenoh::prelude::r#async::*;
-    /// use zenoh::config::ModeDependentValue::Unique;
-    /// use zenoh_ext::ArcSessionExt;
-    ///
-    /// let mut config = config::default();
-    /// config.timestamping.set_enabled(Some(Unique(true)));
-    /// let session = zenoh::open(config).res().await.unwrap().into_arc();
-    /// let publication_cache = session.declare_publication_cache("key/expression").res().await.unwrap();
-    /// async_std::task::spawn(async move {
-    ///     publication_cache.key_expr();
-    /// }).await;
-    /// # })
-    /// ```
-    fn declare_publication_cache<'b, 'c, TryIntoKeyExpr>(
-        &self,
-        pub_key_expr: TryIntoKeyExpr,
-    ) -> PublicationCacheBuilder<'static, 'b, 'c>
-    where
-        TryIntoKeyExpr: TryInto<KeyExpr<'b>>,
-        <TryIntoKeyExpr as TryInto<KeyExpr<'b>>>::Error: Into<zenoh_result::Error>,
-    {
-        PublicationCacheBuilder::new(
-            SessionRef::Shared(self.clone()),
-            pub_key_expr.try_into().map_err(Into::into),
-        )
+        PublicationCacheBuilder::new(self, pub_key_expr.try_into().map_err(Into::into))
     }
 }

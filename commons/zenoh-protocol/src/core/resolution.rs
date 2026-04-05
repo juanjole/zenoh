@@ -11,10 +11,12 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::{network::RequestId, transport::TransportSn};
 use alloc::string::String;
 use core::{fmt, str::FromStr};
+
 use zenoh_result::{bail, ZError};
+
+use crate::{network::RequestId, transport::TransportSn};
 
 #[repr(u8)]
 // The value represents the 2-bit encoded value
@@ -27,10 +29,10 @@ pub enum Bits {
 }
 
 impl Bits {
-    const S8: &str = "8bit";
-    const S16: &str = "16bit";
-    const S32: &str = "32bit";
-    const S64: &str = "64bit";
+    const S8: &'static str = "8bit";
+    const S16: &'static str = "16bit";
+    const S32: &'static str = "32bit";
+    const S64: &'static str = "64bit";
 
     pub const fn bits(&self) -> u32 {
         match self {
@@ -111,7 +113,7 @@ impl fmt::Display for Bits {
 }
 
 #[repr(u8)]
-// The value indicates the bit offest
+// The value indicates the bit offset
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     FrameSN = 0,
@@ -138,6 +140,7 @@ impl Resolution {
     }
 
     #[cfg(feature = "test")]
+    #[doc(hidden)]
     pub fn rand() -> Self {
         use rand::Rng;
 

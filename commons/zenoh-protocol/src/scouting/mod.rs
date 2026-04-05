@@ -14,7 +14,7 @@
 pub mod hello;
 pub mod scout;
 
-pub use hello::Hello;
+pub use hello::HelloProto;
 pub use scout::Scout;
 
 pub mod id {
@@ -27,18 +27,17 @@ pub mod id {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScoutingBody {
     Scout(Scout),
-    Hello(Hello),
+    Hello(HelloProto),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScoutingMessage {
     pub body: ScoutingBody,
-    #[cfg(feature = "stats")]
-    pub size: Option<core::num::NonZeroUsize>,
 }
 
 impl ScoutingMessage {
     #[cfg(feature = "test")]
+    #[doc(hidden)]
     pub fn rand() -> Self {
         use rand::Rng;
 
@@ -46,7 +45,7 @@ impl ScoutingMessage {
 
         match rng.gen_range(0..2) {
             0 => ScoutingBody::Scout(Scout::rand()),
-            1 => ScoutingBody::Hello(Hello::rand()),
+            1 => ScoutingBody::Hello(HelloProto::rand()),
             _ => unreachable!(),
         }
         .into()
@@ -55,11 +54,7 @@ impl ScoutingMessage {
 
 impl From<ScoutingBody> for ScoutingMessage {
     fn from(body: ScoutingBody) -> Self {
-        Self {
-            body,
-            #[cfg(feature = "stats")]
-            size: None,
-        }
+        Self { body }
     }
 }
 
@@ -69,8 +64,8 @@ impl From<Scout> for ScoutingMessage {
     }
 }
 
-impl From<Hello> for ScoutingMessage {
-    fn from(hello: Hello) -> Self {
+impl From<HelloProto> for ScoutingMessage {
+    fn from(hello: HelloProto) -> Self {
         ScoutingBody::Hello(hello).into()
     }
 }

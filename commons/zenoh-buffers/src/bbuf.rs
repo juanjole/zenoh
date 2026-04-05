@@ -11,6 +11,11 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use core::{fmt, num::NonZeroUsize, option};
+
 use crate::{
     buffer::{Buffer, SplitBuffer},
     reader::HasReader,
@@ -18,8 +23,6 @@ use crate::{
     writer::{BacktrackableWriter, DidntWrite, HasWriter, Writer},
     ZSlice,
 };
-use alloc::{boxed::Box, sync::Arc};
-use core::{fmt, num::NonZeroUsize, option};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct BBuf {
@@ -105,7 +108,7 @@ impl HasWriter for &mut BBuf {
     }
 }
 
-impl Writer for &mut BBuf {
+impl Writer for BBuf {
     fn write(&mut self, bytes: &[u8]) -> Result<NonZeroUsize, DidntWrite> {
         let mut writer = self.as_writable_slice().writer();
         let len = writer.write(bytes)?;
@@ -113,6 +116,7 @@ impl Writer for &mut BBuf {
         Ok(len)
     }
 
+    #[inline(always)]
     fn write_exact(&mut self, bytes: &[u8]) -> Result<(), DidntWrite> {
         let mut writer = self.as_writable_slice().writer();
         writer.write_exact(bytes)?;
@@ -124,7 +128,11 @@ impl Writer for &mut BBuf {
         self.capacity() - self.len()
     }
 
-    fn with_slot<F>(&mut self, len: usize, f: F) -> Result<NonZeroUsize, DidntWrite>
+    /// # Safety
+    ///
+    /// The `write` closure must return the number of bytes actually written to the slice,
+    /// which must be less than or equal to `len`.
+    unsafe fn with_slot<F>(&mut self, len: usize, write: F) -> Result<NonZeroUsize, DidntWrite>
     where
         F: FnOnce(&mut [u8]) -> usize,
     {
@@ -132,14 +140,16 @@ impl Writer for &mut BBuf {
             return Err(DidntWrite);
         }
 
-        let written = f(self.as_writable_slice());
+        // SAFETY: `written` <= `len` is guaranteed by the safety contract of this function.
+        // `get_unchecked_mut(..len)` is safe because `self.remaining() >= len`.
+        let written = unsafe { write(self.as_writable_slice().get_unchecked_mut(..len)) };
         self.len += written;
 
         NonZeroUsize::new(written).ok_or(DidntWrite)
     }
 }
 
-impl BacktrackableWriter for &mut BBuf {
+impl BacktrackableWriter for BBuf {
     type Mark = usize;
 
     fn mark(&mut self) -> Self::Mark {
@@ -153,7 +163,7 @@ impl BacktrackableWriter for &mut BBuf {
 }
 
 #[cfg(feature = "std")]
-impl std::io::Write for &mut BBuf {
+impl std::io::Write for BBuf {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match <Self as Writer>::write(self, buf) {
             Ok(n) => Ok(n.get()),
@@ -181,21 +191,20 @@ impl<'a> HasReader for &'a BBuf {
 // From impls
 impl From<BBuf> for ZSlice {
     fn from(value: BBuf) -> Self {
-        ZSlice {
-            buf: Arc::new(value.buffer),
-            start: 0,
-            end: value.len,
-            #[cfg(feature = "shared-memory")]
-            kind: crate::ZSliceKind::Raw,
-        }
+        // SAFETY: buffer length is ensured to be lesser than its capacity.
+        // unwrap_unchecked() is safe because ZSlice::new only fails if end < start,
+        // which is not the case here (0 and value.len).
+        unsafe { ZSlice::new(Arc::new(value.buffer), 0, value.len).unwrap_unchecked() }
     }
 }
 
 #[cfg(feature = "test")]
 impl BBuf {
+    #[doc(hidden)]
     pub fn rand(len: usize) -> Self {
         #[cfg(not(feature = "std"))]
         use alloc::vec::Vec;
+
         use rand::Rng;
 
         let mut rng = rand::thread_rng();

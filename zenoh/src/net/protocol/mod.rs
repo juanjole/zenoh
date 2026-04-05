@@ -11,4 +11,8 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+pub(crate) mod gossip;
 pub(crate) mod linkstate;
+pub(crate) mod network;
+
+pub(crate) const ROUTERS_NET_NAME: &str = "[Routers Network]";

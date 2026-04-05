@@ -1,5 +1,3 @@
-use std::io::{stdin, Read};
-
 //
 // Copyright (c) 2023 ZettaScale Technology
 //
@@ -14,18 +12,16 @@ use std::io::{stdin, Read};
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use clap::Parser;
-use zenoh::config::Config;
-use zenoh::prelude::sync::*;
-use zenoh::publication::CongestionControl;
+use zenoh::{key_expr::keyexpr, qos::CongestionControl, Config, Wait};
 use zenoh_examples::CommonArgs;
 
 fn main() {
     // initiate logging
-    env_logger::init();
+    zenoh::init_log_from_env_or("error");
 
-    let config = parse_args();
+    let (config, express) = parse_args();
 
-    let session = zenoh::open(config).res().unwrap().into_arc();
+    let session = zenoh::open(config).wait().unwrap();
 
     // The key expression to read the data from
     let key_expr_ping = keyexpr::new("test/ping").unwrap();
@@ -36,24 +32,29 @@ fn main() {
     let publisher = session
         .declare_publisher(key_expr_pong)
         .congestion_control(CongestionControl::Block)
-        .res()
+        .express(express)
+        .wait()
         .unwrap();
 
-    let _sub = session
+    session
         .declare_subscriber(key_expr_ping)
-        .callback(move |sample| publisher.put(sample.value).res().unwrap())
-        .res()
+        .callback(move |sample| publisher.put(sample.payload().clone()).wait().unwrap())
+        .background()
+        .wait()
         .unwrap();
-    for _ in stdin().bytes().take_while(|b| !matches!(b, Ok(b'q'))) {}
+    std::thread::park();
 }
 
 #[derive(clap::Parser, Clone, PartialEq, Eq, Hash, Debug)]
 struct Args {
+    /// express for sending data
+    #[arg(long, default_value = "false")]
+    no_express: bool,
     #[command(flatten)]
     common: CommonArgs,
 }
 
-fn parse_args() -> Config {
+fn parse_args() -> (Config, bool) {
     let args = Args::parse();
-    args.common.into()
+    (args.common.into(), !args.no_express)
 }

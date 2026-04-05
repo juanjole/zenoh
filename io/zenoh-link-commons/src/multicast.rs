@@ -12,19 +12,22 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use alloc::{borrow::Cow, boxed::Box, sync::Arc, vec::Vec};
-use async_trait::async_trait;
 use core::{
     fmt,
     hash::{Hash, Hasher},
     ops::Deref,
 };
+
+use async_trait::async_trait;
 use zenoh_buffers::{reader::HasReader, writer::HasWriter};
 use zenoh_codec::{RCodec, WCodec, Zenoh080};
 use zenoh_protocol::{
     core::{EndPoint, Locator},
-    transport::TransportMessage,
+    transport::{BatchSize, TransportMessage},
 };
 use zenoh_result::{zerror, ZResult};
+
+use crate::LinkAuthId;
 
 /*************************************/
 /*             MANAGER               */
@@ -44,9 +47,10 @@ pub struct LinkMulticast(pub Arc<dyn LinkMulticastTrait>);
 
 #[async_trait]
 pub trait LinkMulticastTrait: Send + Sync {
-    fn get_mtu(&self) -> u16;
+    fn get_mtu(&self) -> BatchSize;
     fn get_src(&self) -> &Locator;
     fn get_dst(&self) -> &Locator;
+    fn get_auth_id(&self) -> &LinkAuthId;
     fn is_reliable(&self) -> bool;
     async fn write(&self, buffer: &[u8]) -> ZResult<usize>;
     async fn write_all(&self, buffer: &[u8]) -> ZResult<()>;

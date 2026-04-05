@@ -11,6 +11,17 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+use std::sync::Arc;
+
+use rand::Rng;
+use zenoh_core::zasynclock;
+use zenoh_link::LinkMulticast;
+use zenoh_protocol::{
+    core::{Field, Priority},
+    transport::PrioritySn,
+};
+use zenoh_result::{bail, ZResult};
+
 use crate::{
     common::{batch::BatchConfig, seq_num},
     multicast::{
@@ -20,15 +31,6 @@ use crate::{
     },
     TransportManager,
 };
-use rand::Rng;
-use std::sync::Arc;
-use zenoh_core::zasynclock;
-use zenoh_link::LinkMulticast;
-use zenoh_protocol::{
-    core::{Field, Priority},
-    transport::PrioritySn,
-};
-use zenoh_result::{bail, ZResult};
 
 pub(crate) async fn open_link(
     manager: &TransportManager,
@@ -75,10 +77,22 @@ pub(crate) async fn open_link(
         link,
         sn_resolution,
         initial_sns,
-        #[cfg(feature = "shared-memory")]
-        is_shm: manager.config.multicast.is_shm,
     };
-    let ti = Arc::new(TransportMulticastInner::make(manager.clone(), config)?);
+
+    #[cfg(feature = "shared-memory")]
+    let shm_context = manager.state.shm_context.as_ref().map(|context| {
+        crate::shm_context::MulticastTransportShmContext::new(
+            context.shm_reader.clone(),
+            context.shm_provider.clone(),
+        )
+    });
+
+    let ti = Arc::new(TransportMulticastInner::make(
+        manager.clone(),
+        config,
+        #[cfg(feature = "shared-memory")]
+        shm_context,
+    )?);
 
     // Add the link
     ti.start_tx()?;
@@ -91,6 +105,7 @@ pub(crate) async fn open_link(
     w_guard.insert(locator.clone(), ti.clone());
     drop(w_guard);
 
+    // TODO(yuyuan): resolve the structure entanglement below
     // Notify the transport event handler
     let transport: TransportMulticast = (&ti).into();
 

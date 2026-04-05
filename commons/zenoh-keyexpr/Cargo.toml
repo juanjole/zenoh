@@ -12,20 +12,23 @@
 #   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 #
 [package]
-rust-version = { workspace = true }
-name = "zenoh-keyexpr"
-version = { workspace = true }
-repository = { workspace = true }
-homepage = { workspace = true }
 authors = { workspace = true }
-edition = { workspace = true }
-license = { workspace = true }
 categories = { workspace = true }
 description = "Internal crate for zenoh."
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+name = "zenoh-keyexpr"
+repository = { workspace = true }
+rust-version = { workspace = true }
+version = { workspace = true }
 
 [features]
 default = ["std"]
-std = ["zenoh-result/std", "dep:schemars"]
+internal = []
+js = ["getrandom/js"]
+std = ["dep:schemars", "zenoh-result/std"]
+unstable = []
 
 [dependencies]
 keyed-set = { workspace = true }
@@ -34,16 +37,25 @@ schemars = { workspace = true, optional = true }
 serde = { workspace = true, features = ["alloc"] }
 token-cell = { workspace = true }
 zenoh-result = { workspace = true }
+# NOTE: getrandom needs to be explicitly added here in order to enable the `js` feature when compiling the rand crate to WASM
+# more information: https://docs.rs/getrandom/latest/getrandom/#webassembly-support 
+getrandom = { workspace = true }
 
 [target.'cfg(not(features = "std"))'.dependencies]
 hashbrown = { workspace = true }
 
 # NOTE: May cause problems when testing no_std stuff. Check this tool: https://docs.rs/crate/cargo-no-dev-deps/0.1.0
 [dev-dependencies]
+ahash = { workspace = true, default-features = true }
 criterion = { workspace = true }
 lazy_static = { workspace = true }
 rand = { workspace = true, features = ["default"] }
+test-case = { workspace = true }
 
 [[bench]]
-name = "keyexpr_tree"
 harness = false
+name = "keyexpr_tree"
+
+# NOTE: for the above reason, we need to explicitly ignore getrandom in the CI because it's an indirect dependency which is not used directly by zenoh.
+[package.metadata.cargo-machete]
+ignored = ["getrandom"]

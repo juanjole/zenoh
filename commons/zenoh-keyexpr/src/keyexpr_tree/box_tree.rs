@@ -17,16 +17,15 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use core::ptr::NonNull;
 
-use crate::keyexpr;
-use crate::keyexpr_tree::{
-    support::{IWildness, NonWild, UnknownWildness},
-    *,
+use super::support::IterOrOption;
+use crate::{
+    keyexpr,
+    keyexpr_tree::{support::IWildness, *},
 };
 
-use super::impls::KeyedSetProvider;
-use super::support::IterOrOption;
-
 /// A fully owned KeTree.
+///
+/// Note that most of `KeBoxTree`'s methods are declared in the [`IKeyExprTree`] and [`IKeyExprTreeMut`] traits.
 #[repr(C)]
 pub struct KeBoxTree<
     Weight,
@@ -37,17 +36,13 @@ pub struct KeBoxTree<
     wildness: Wildness,
 }
 
-impl<
-        Weight,
-        Wildness: IWildness,
-        Children: IChildrenProvider<Box<KeyExprTreeNode<Weight, Wildness, Children>>>,
-    > KeBoxTree<Weight, Wildness, Children>
+impl<Weight> KeBoxTree<Weight, bool, DefaultChildrenProvider>
+where
+    DefaultChildrenProvider:
+        IChildrenProvider<Box<KeyExprTreeNode<Weight, bool, DefaultChildrenProvider>>>,
 {
     pub fn new() -> Self {
-        KeBoxTree {
-            children: Default::default(),
-            wildness: Wildness::non_wild(),
-        }
+        Default::default()
     }
 }
 impl<
@@ -57,7 +52,10 @@ impl<
     > Default for KeBoxTree<Weight, Wildness, Children>
 {
     fn default() -> Self {
-        Self::new()
+        KeBoxTree {
+            children: Default::default(),
+            wildness: Wildness::non_wild(),
+        }
     }
 }
 
@@ -77,7 +75,7 @@ where
 {
     type Node = KeyExprTreeNode<Weight, Wildness, Children>;
     fn node(&'a self, at: &keyexpr) -> Option<&'a Self::Node> {
-        let mut chunks = at.chunks();
+        let mut chunks = at.chunks_impl();
         let mut node = self.children.child_at(chunks.next().unwrap())?;
         for chunk in chunks {
             node = node.as_node().children.child_at(chunk)?;
@@ -96,7 +94,7 @@ where
         &'a Self::Node,
     >;
     fn intersecting_nodes(&'a self, ke: &'a keyexpr) -> Self::Intersection {
-        if self.wildness.get() || ke.is_wild() {
+        if self.wildness.get() || ke.is_wild_impl() {
             Intersection::new(&self.children, ke).into()
         } else {
             let node = self.node(ke);
@@ -110,8 +108,22 @@ where
         &'a Self::Node,
     >;
     fn included_nodes(&'a self, ke: &'a keyexpr) -> Self::Inclusion {
-        if self.wildness.get() || ke.is_wild() {
+        if self.wildness.get() || ke.is_wild_impl() {
             Inclusion::new(&self.children, ke).into()
+        } else {
+            let node = self.node(ke);
+            IterOrOption::Opt(node)
+        }
+    }
+
+    type IncluderItem = <Self::Includer as Iterator>::Item;
+    type Includer = IterOrOption<
+        Includer<'a, Children, Box<KeyExprTreeNode<Weight, Wildness, Children>>, Weight>,
+        &'a Self::Node,
+    >;
+    fn nodes_including(&'a self, ke: &'a keyexpr) -> Self::Includer {
+        if self.wildness.get() || ke.is_wild_impl() {
+            Includer::new(&self.children, ke).into()
         } else {
             let node = self.node(ke);
             IterOrOption::Opt(node)
@@ -133,7 +145,7 @@ where
         > + 'a,
 {
     fn node_mut<'b>(&'b mut self, at: &keyexpr) -> Option<&'b mut Self::Node> {
-        let mut chunks = at.chunks();
+        let mut chunks = at.chunks_impl();
         let mut node = self.children.child_at_mut(chunks.next().unwrap())?;
         for chunk in chunks {
             node = node.as_node_mut().children.child_at_mut(chunk)?;
@@ -146,9 +158,11 @@ where
         if !node.children.is_empty() {
             node.weight.take()
         } else {
-            let chunk = unsafe { core::mem::transmute::<_, &keyexpr>(node.chunk()) };
+            // SAFETY: upheld by the surrounding invariants and prior validation.
+            let chunk = unsafe { core::mem::transmute::<&keyexpr, &keyexpr>(node.chunk()) };
             match node.parent {
                 None => &mut self.children,
+                // SAFETY: upheld by the surrounding invariants and prior validation.
                 Some(parent) => unsafe { &mut (*parent.as_ptr()).children },
             }
             .remove(chunk)
@@ -157,10 +171,10 @@ where
     }
 
     fn node_mut_or_create<'b>(&'b mut self, at: &keyexpr) -> &'b mut Self::Node {
-        if at.is_wild() {
+        if at.is_wild_impl() {
             self.wildness.set(true);
         }
-        let mut chunks = at.chunks();
+        let mut chunks = at.chunks_impl();
         let mut node = self
             .children
             .entry(chunks.next().unwrap())
@@ -198,7 +212,7 @@ where
         &'a mut Self::Node,
     >;
     fn intersecting_nodes_mut(&'a mut self, ke: &'a keyexpr) -> Self::IntersectionMut {
-        if self.wildness.get() || ke.is_wild() {
+        if self.wildness.get() || ke.is_wild_impl() {
             IntersectionMut::new(&mut self.children, ke).into()
         } else {
             let node = self.node_mut(ke);
@@ -211,8 +225,21 @@ where
         &'a mut Self::Node,
     >;
     fn included_nodes_mut(&'a mut self, ke: &'a keyexpr) -> Self::InclusionMut {
-        if self.wildness.get() || ke.is_wild() {
+        if self.wildness.get() || ke.is_wild_impl() {
             InclusionMut::new(&mut self.children, ke).into()
+        } else {
+            let node = self.node_mut(ke);
+            IterOrOption::Opt(node)
+        }
+    }
+    type IncluderItemMut = <Self::IncluderMut as Iterator>::Item;
+    type IncluderMut = IterOrOption<
+        IncluderMut<'a, Children, Box<KeyExprTreeNode<Weight, Wildness, Children>>, Weight>,
+        &'a mut Self::Node,
+    >;
+    fn nodes_including_mut(&'a mut self, ke: &'a keyexpr) -> Self::IncluderMut {
+        if self.wildness.get() || ke.is_wild_impl() {
+            IncluderMut::new(&mut self.children, ke).into()
         } else {
             let node = self.node_mut(ke);
             IterOrOption::Opt(node)
@@ -263,24 +290,34 @@ where
     Children::Assoc: IChildren<Box<Self>>,
 {
     type Parent = Self;
+    /// # Safety
+    /// Callers must uphold the invariants required by this unsafe API.
     unsafe fn __parent(&self) -> Option<&Self> {
+        // SAFETY: upheld by the surrounding invariants and prior validation.
         self.parent.as_ref().map(|node| unsafe {
             // this is safe, as a mutable reference to the parent was needed to get a mutable reference to this node in the first place.
             node.as_ref()
         })
     }
+    /// # Safety
+    /// Callers must uphold the invariants required by this unsafe API.
     unsafe fn __keyexpr(&self) -> OwnedKeyExpr {
+        // SAFETY: upheld by the surrounding invariants and prior validation.
         unsafe {
             // self._keyexpr is guaranteed to return a valid KE, so no checks are necessary
             OwnedKeyExpr::from_string_unchecked(self._keyexpr(0))
         }
     }
+    /// # Safety
+    /// Callers must uphold the invariants required by this unsafe API.
     unsafe fn __weight(&self) -> Option<&Weight> {
         self.weight.as_ref()
     }
     type Child = Box<Self>;
     type Children = Children::Assoc;
 
+    /// # Safety
+    /// Callers must uphold the invariants required by this unsafe API.
     unsafe fn __children(&self) -> &Self::Children {
         &self.children
     }
@@ -293,6 +330,7 @@ where
     fn parent_mut(&mut self) -> Option<&mut Self> {
         match &mut self.parent {
             None => None,
+            // SAFETY: upheld by the surrounding invariants and prior validation.
             Some(node) => Some(unsafe {
                 // this is safe, as a mutable reference to the parent was needed to get a mutable reference to this node in the first place.
                 node.as_mut()
@@ -340,7 +378,7 @@ where
             });
         if predicate(self) && self.children.is_empty() {
             result = PruneResult::Delete
-        } else if self.chunk.is_wild() {
+        } else if self.chunk.is_wild_impl() {
             result = PruneResult::Wild
         }
         result
@@ -371,26 +409,6 @@ impl<Weight, Wildness: IWildness, Children: IChildrenProvider<Box<Self>>> AsMut<
 {
     fn as_mut(&mut self) -> &mut Self {
         self
-    }
-}
-
-trait TransmuteInto<T> {
-    fn transmute_into(self) -> T;
-}
-impl<'a, Weight: 'static>
-    TransmuteInto<&'a mut KeyExprTreeNode<Weight, UnknownWildness, KeyedSetProvider>>
-    for &'a mut KeyExprTreeNode<Weight, NonWild, KeyedSetProvider>
-{
-    fn transmute_into(self) -> &'a mut KeyExprTreeNode<Weight, UnknownWildness, KeyedSetProvider> {
-        unsafe { core::mem::transmute(self) }
-    }
-}
-impl<'a, Weight: 'static>
-    TransmuteInto<&'a KeyExprTreeNode<Weight, UnknownWildness, KeyedSetProvider>>
-    for &'a KeyExprTreeNode<Weight, NonWild, KeyedSetProvider>
-{
-    fn transmute_into(self) -> &'a KeyExprTreeNode<Weight, UnknownWildness, KeyedSetProvider> {
-        unsafe { core::mem::transmute(self) }
     }
 }
 

@@ -11,48 +11,135 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::{RCodec, WCodec, Zenoh080};
+use std::num::NonZeroUsize;
+
 use zenoh_buffers::{
     reader::{DidntRead, Reader},
     writer::{DidntWrite, Writer},
 };
-use zenoh_shm::SharedMemoryBufInfo;
+use zenoh_shm::{
+    api::provider::chunk::ChunkDescriptor, metadata::descriptor::MetadataDescriptor, ShmBufInfo,
+};
 
-impl<W> WCodec<&SharedMemoryBufInfo, &mut W> for Zenoh080
+use crate::{RCodec, WCodec, Zenoh080};
+
+impl<W> WCodec<&MetadataDescriptor, &mut W> for Zenoh080
 where
     W: Writer,
 {
     type Output = Result<(), DidntWrite>;
 
-    fn write(self, writer: &mut W, x: &SharedMemoryBufInfo) -> Self::Output {
-        let SharedMemoryBufInfo {
-            offset,
-            length,
-            shm_manager,
-            kind,
-        } = x;
-
-        self.write(&mut *writer, offset)?;
-        self.write(&mut *writer, length)?;
-        self.write(&mut *writer, shm_manager.as_str())?;
-        self.write(&mut *writer, kind)?;
+    fn write(self, writer: &mut W, x: &MetadataDescriptor) -> Self::Output {
+        self.write(&mut *writer, x.id)?;
+        self.write(&mut *writer, x.index)?;
         Ok(())
     }
 }
 
-impl<R> RCodec<SharedMemoryBufInfo, &mut R> for Zenoh080
+impl<W> WCodec<&ChunkDescriptor, &mut W> for Zenoh080
+where
+    W: Writer,
+{
+    type Output = Result<(), DidntWrite>;
+
+    fn write(self, writer: &mut W, x: &ChunkDescriptor) -> Self::Output {
+        self.write(&mut *writer, x.segment)?;
+        self.write(&mut *writer, x.chunk)?;
+        self.write(&mut *writer, x.len)?;
+        Ok(())
+    }
+}
+
+impl<W> WCodec<NonZeroUsize, &mut W> for Zenoh080
+where
+    W: Writer,
+{
+    type Output = Result<(), DidntWrite>;
+
+    fn write(self, writer: &mut W, x: NonZeroUsize) -> Self::Output {
+        self.write(&mut *writer, x.get())?;
+        Ok(())
+    }
+}
+
+impl<W> WCodec<&ShmBufInfo, &mut W> for Zenoh080
+where
+    W: Writer,
+{
+    type Output = Result<(), DidntWrite>;
+
+    fn write(self, writer: &mut W, x: &ShmBufInfo) -> Self::Output {
+        let ShmBufInfo {
+            data_len,
+            metadata,
+            generation,
+        } = x;
+
+        self.write(&mut *writer, *data_len)?;
+        self.write(&mut *writer, metadata)?;
+        self.write(&mut *writer, generation)?;
+        Ok(())
+    }
+}
+
+impl<R> RCodec<MetadataDescriptor, &mut R> for Zenoh080
 where
     R: Reader,
 {
     type Error = DidntRead;
 
-    fn read(self, reader: &mut R) -> Result<SharedMemoryBufInfo, Self::Error> {
-        let offset: usize = self.read(&mut *reader)?;
-        let length: usize = self.read(&mut *reader)?;
-        let shm_manager: String = self.read(&mut *reader)?;
-        let kind: u8 = self.read(&mut *reader)?;
+    fn read(self, reader: &mut R) -> Result<MetadataDescriptor, Self::Error> {
+        let id = self.read(&mut *reader)?;
+        let index = self.read(&mut *reader)?;
 
-        let shm_info = SharedMemoryBufInfo::new(offset, length, shm_manager, kind);
+        Ok(MetadataDescriptor { id, index })
+    }
+}
+
+impl<R> RCodec<ChunkDescriptor, &mut R> for Zenoh080
+where
+    R: Reader,
+{
+    type Error = DidntRead;
+
+    fn read(self, reader: &mut R) -> Result<ChunkDescriptor, Self::Error> {
+        let segment = self.read(&mut *reader)?;
+        let chunk = self.read(&mut *reader)?;
+        let len = self.read(&mut *reader)?;
+
+        Ok(ChunkDescriptor {
+            segment,
+            chunk,
+            len,
+        })
+    }
+}
+
+impl<R> RCodec<NonZeroUsize, &mut R> for Zenoh080
+where
+    R: Reader,
+{
+    type Error = DidntRead;
+
+    fn read(self, reader: &mut R) -> Result<NonZeroUsize, Self::Error> {
+        let size: usize = self.read(&mut *reader)?;
+        let size = NonZeroUsize::new(size).ok_or(DidntRead)?;
+        Ok(size)
+    }
+}
+
+impl<R> RCodec<ShmBufInfo, &mut R> for Zenoh080
+where
+    R: Reader,
+{
+    type Error = DidntRead;
+
+    fn read(self, reader: &mut R) -> Result<ShmBufInfo, Self::Error> {
+        let data_len = self.read(&mut *reader)?;
+        let metadata = self.read(&mut *reader)?;
+        let generation = self.read(&mut *reader)?;
+
+        let shm_info = ShmBufInfo::new(data_len, metadata, generation);
         Ok(shm_info)
     }
 }

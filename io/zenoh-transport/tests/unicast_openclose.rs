@@ -11,11 +11,11 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use async_std::{prelude::FutureExt, task};
 use std::{convert::TryFrom, sync::Arc, time::Duration};
-use zenoh_core::zasync_executor_init;
+
+use zenoh_core::ztimeout;
 use zenoh_link::EndPoint;
-use zenoh_protocol::core::{WhatAmI, ZenohId};
+use zenoh_protocol::core::{WhatAmI, ZenohIdProto};
 use zenoh_result::ZResult;
 use zenoh_transport::{
     multicast::TransportMulticast,
@@ -23,13 +23,17 @@ use zenoh_transport::{
     DummyTransportPeerEventHandler, TransportEventHandler, TransportManager,
     TransportMulticastEventHandler, TransportPeer, TransportPeerEventHandler,
 };
+#[cfg(target_os = "linux")]
+#[cfg(any(feature = "transport_tcp", feature = "transport_udp"))]
+use zenoh_util::net::get_ipv4_ipaddrs;
 
 const TIMEOUT: Duration = Duration::from_secs(60);
+const TIMEOUT_EXPECTED: Duration = Duration::from_secs(5);
 const SLEEP: Duration = Duration::from_millis(100);
 
-macro_rules! ztimeout {
+macro_rules! ztimeout_expected {
     ($f:expr) => {
-        $f.timeout(TIMEOUT).await.unwrap()
+        tokio::time::timeout(TIMEOUT_EXPECTED, $f).await.unwrap()
     };
 }
 
@@ -80,17 +84,19 @@ impl TransportEventHandler for SHClientOpenClose {
     }
 }
 
-async fn openclose_transport(endpoint: &EndPoint, lowlatency_transport: bool) {
+async fn openclose_transport(
+    listen_endpoint: &EndPoint,
+    connect_endpoint: &EndPoint,
+    lowlatency_transport: bool,
+) {
     /* [ROUTER] */
-    let router_id = ZenohId::try_from([1]).unwrap();
+    let router_id = ZenohIdProto::try_from([1]).unwrap();
 
     let router_handler = Arc::new(SHRouterOpenClose);
     // Create the router transport manager
     let unicast = make_transport_manager_builder(
         #[cfg(feature = "transport_multilink")]
         2,
-        #[cfg(feature = "shared-memory")]
-        false,
         lowlatency_transport,
     )
     .max_sessions(1);
@@ -98,19 +104,17 @@ async fn openclose_transport(endpoint: &EndPoint, lowlatency_transport: bool) {
         .whatami(WhatAmI::Router)
         .zid(router_id)
         .unicast(unicast)
-        .build(router_handler.clone())
+        .build_test(router_handler.clone())
         .unwrap();
 
     /* [CLIENT] */
-    let client01_id = ZenohId::try_from([2]).unwrap();
-    let client02_id = ZenohId::try_from([3]).unwrap();
+    let client01_id = ZenohIdProto::try_from([2]).unwrap();
+    let client02_id = ZenohIdProto::try_from([3]).unwrap();
 
     // Create the transport transport manager for the first client
     let unicast = make_transport_manager_builder(
         #[cfg(feature = "transport_multilink")]
         2,
-        #[cfg(feature = "shared-memory")]
-        false,
         lowlatency_transport,
     )
     .max_sessions(1);
@@ -118,15 +122,13 @@ async fn openclose_transport(endpoint: &EndPoint, lowlatency_transport: bool) {
         .whatami(WhatAmI::Client)
         .zid(client01_id)
         .unicast(unicast)
-        .build(Arc::new(SHClientOpenClose::new()))
+        .build_test(Arc::new(SHClientOpenClose::new()))
         .unwrap();
 
     // Create the transport transport manager for the second client
     let unicast = make_transport_manager_builder(
         #[cfg(feature = "transport_multilink")]
         1,
-        #[cfg(feature = "shared-memory")]
-        false,
         lowlatency_transport,
     )
     .max_sessions(1);
@@ -134,17 +136,17 @@ async fn openclose_transport(endpoint: &EndPoint, lowlatency_transport: bool) {
         .whatami(WhatAmI::Client)
         .zid(client02_id)
         .unicast(unicast)
-        .build(Arc::new(SHClientOpenClose::new()))
+        .build_test(Arc::new(SHClientOpenClose::new()))
         .unwrap();
 
     /* [1] */
     println!("\nTransport Open Close [1a1]");
     // Add the locator on the router
-    let res = ztimeout!(router_manager.add_listener(endpoint.clone()));
+    let res = ztimeout!(router_manager.add_listener(listen_endpoint.clone()));
     println!("Transport Open Close [1a1]: {res:?}");
     assert!(res.is_ok());
     println!("Transport Open Close [1a2]");
-    let locators = router_manager.get_listeners();
+    let locators = ztimeout!(router_manager.get_listeners());
     println!("Transport Open Close [1a2]: {locators:?}");
     assert_eq!(locators.len(), 1);
 
@@ -153,10 +155,11 @@ async fn openclose_transport(endpoint: &EndPoint, lowlatency_transport: bool) {
     let mut links_num = 1;
 
     println!("Transport Open Close [1c1]");
-    let res = ztimeout!(client01_manager.open_transport_unicast(endpoint.clone()));
-    println!("Transport Open Close [1c2]: {res:?}");
-    assert!(res.is_ok());
-    let c_ses1 = res.unwrap();
+    let open_res =
+        ztimeout_expected!(client01_manager.open_transport_unicast(connect_endpoint.clone()));
+    println!("Transport Open Close [1c2]: {open_res:?}");
+    assert!(open_res.is_ok());
+    let c_ses1 = open_res.unwrap();
     println!("Transport Open Close [1d1]");
     let transports = ztimeout!(client01_manager.get_transports_unicast());
     println!("Transport Open Close [1d2]: {transports:?}");
@@ -182,7 +185,7 @@ async fn openclose_transport(endpoint: &EndPoint, lowlatency_transport: bool) {
                     assert_eq!(links.len(), links_num);
                     break;
                 }
-                None => task::sleep(SLEEP).await,
+                None => tokio::time::sleep(SLEEP).await,
             }
         }
     });
@@ -195,7 +198,7 @@ async fn openclose_transport(endpoint: &EndPoint, lowlatency_transport: bool) {
         links_num = 2;
 
         println!("\nTransport Open Close [2a1]");
-        let res = ztimeout!(client01_manager.open_transport_unicast(endpoint.clone()));
+        let res = ztimeout!(client01_manager.open_transport_unicast(connect_endpoint.clone()));
         println!("Transport Open Close [2a2]: {res:?}");
         assert!(res.is_ok());
         let c_ses2 = res.unwrap();
@@ -224,7 +227,7 @@ async fn openclose_transport(endpoint: &EndPoint, lowlatency_transport: bool) {
                 if links.len() == links_num {
                     break;
                 }
-                task::sleep(SLEEP).await;
+                tokio::time::sleep(SLEEP).await;
             }
         });
     } else {
@@ -235,7 +238,7 @@ async fn openclose_transport(endpoint: &EndPoint, lowlatency_transport: bool) {
     // Open transport -> This should be rejected because
     // of the maximum limit of links per transport
     println!("\nTransport Open Close [3a1]");
-    let res = ztimeout!(client01_manager.open_transport_unicast(endpoint.clone()));
+    let res = ztimeout!(client01_manager.open_transport_unicast(connect_endpoint.clone()));
     println!("Transport Open Close [3a2]: {res:?}");
     assert!(res.is_err());
     println!("Transport Open Close [3b1]");
@@ -251,7 +254,7 @@ async fn openclose_transport(endpoint: &EndPoint, lowlatency_transport: bool) {
     // Verify that the transport has not been open on the router
     println!("Transport Open Close [3d1]");
     ztimeout!(async {
-        task::sleep(SLEEP).await;
+        tokio::time::sleep(SLEEP).await;
         let transports = ztimeout!(router_manager.get_transports_unicast());
         assert_eq!(transports.len(), 1);
         let s = transports
@@ -284,7 +287,7 @@ async fn openclose_transport(endpoint: &EndPoint, lowlatency_transport: bool) {
             if index.is_none() {
                 break;
             }
-            task::sleep(SLEEP).await;
+            tokio::time::sleep(SLEEP).await;
         }
     });
 
@@ -294,7 +297,7 @@ async fn openclose_transport(endpoint: &EndPoint, lowlatency_transport: bool) {
     links_num = 1;
 
     println!("\nTransport Open Close [5a1]");
-    let res = ztimeout!(client01_manager.open_transport_unicast(endpoint.clone()));
+    let res = ztimeout!(client01_manager.open_transport_unicast(connect_endpoint.clone()));
     println!("Transport Open Close [5a2]: {res:?}");
     assert!(res.is_ok());
     let c_ses3 = res.unwrap();
@@ -311,7 +314,7 @@ async fn openclose_transport(endpoint: &EndPoint, lowlatency_transport: bool) {
     // Verify that the transport has been open on the router
     println!("Transport Open Close [5d1]");
     ztimeout!(async {
-        task::sleep(SLEEP).await;
+        tokio::time::sleep(SLEEP).await;
         let transports = ztimeout!(router_manager.get_transports_unicast());
         assert_eq!(transports.len(), 1);
         let s = transports
@@ -326,7 +329,7 @@ async fn openclose_transport(endpoint: &EndPoint, lowlatency_transport: bool) {
     // Open transport -> This should be rejected because
     // of the maximum limit of transports
     println!("\nTransport Open Close [6a1]");
-    let res = ztimeout!(client02_manager.open_transport_unicast(endpoint.clone()));
+    let res = ztimeout!(client02_manager.open_transport_unicast(connect_endpoint.clone()));
     println!("Transport Open Close [6a2]: {res:?}");
     assert!(res.is_err());
     println!("Transport Open Close [6b1]");
@@ -337,7 +340,7 @@ async fn openclose_transport(endpoint: &EndPoint, lowlatency_transport: bool) {
     // Verify that the transport has not been open on the router
     println!("Transport Open Close [6c1]");
     ztimeout!(async {
-        task::sleep(SLEEP).await;
+        tokio::time::sleep(SLEEP).await;
         let transports = ztimeout!(router_manager.get_transports_unicast());
         assert_eq!(transports.len(), 1);
         let s = transports
@@ -367,7 +370,7 @@ async fn openclose_transport(endpoint: &EndPoint, lowlatency_transport: bool) {
             if transports.is_empty() {
                 break;
             }
-            task::sleep(SLEEP).await;
+            tokio::time::sleep(SLEEP).await;
         }
     });
 
@@ -377,7 +380,7 @@ async fn openclose_transport(endpoint: &EndPoint, lowlatency_transport: bool) {
     links_num = 1;
 
     println!("\nTransport Open Close [8a1]");
-    let res = ztimeout!(client02_manager.open_transport_unicast(endpoint.clone()));
+    let res = ztimeout!(client02_manager.open_transport_unicast(connect_endpoint.clone()));
     println!("Transport Open Close [8a2]: {res:?}");
     assert!(res.is_ok());
     let c_ses4 = res.unwrap();
@@ -404,7 +407,7 @@ async fn openclose_transport(endpoint: &EndPoint, lowlatency_transport: bool) {
                     assert_eq!(links.len(), links_num);
                     break;
                 }
-                None => task::sleep(SLEEP).await,
+                None => tokio::time::sleep(SLEEP).await,
             }
         }
     });
@@ -428,272 +431,450 @@ async fn openclose_transport(endpoint: &EndPoint, lowlatency_transport: bool) {
             if transports.is_empty() {
                 break;
             }
-            task::sleep(SLEEP).await;
+            tokio::time::sleep(SLEEP).await;
         }
     });
 
     /* [10] */
     // Perform clean up of the open locators
     println!("\nTransport Open Close [10a1]");
-    let res = ztimeout!(router_manager.del_listener(endpoint));
+    let res = ztimeout!(router_manager.del_listener(listen_endpoint));
     println!("Transport Open Close [10a2]: {res:?}");
     assert!(res.is_ok());
 
     ztimeout!(async {
-        while !router_manager.get_listeners().is_empty() {
-            task::sleep(SLEEP).await;
+        while !router_manager.get_listeners().await.is_empty() {
+            tokio::time::sleep(SLEEP).await;
         }
     });
 
     // Wait a little bit
-    task::sleep(SLEEP).await;
+    tokio::time::sleep(SLEEP).await;
 
     ztimeout!(router_manager.close());
     ztimeout!(client01_manager.close());
     ztimeout!(client02_manager.close());
 
     // Wait a little bit
-    task::sleep(SLEEP).await;
+    tokio::time::sleep(SLEEP).await;
 }
 
 async fn openclose_universal_transport(endpoint: &EndPoint) {
-    openclose_transport(endpoint, false).await
+    openclose_transport(endpoint, endpoint, false).await
 }
 
 async fn openclose_lowlatency_transport(endpoint: &EndPoint) {
-    openclose_transport(endpoint, true).await
+    openclose_transport(endpoint, endpoint, true).await
+}
+
+#[cfg(any(feature = "transport_tls", feature = "transport_quic"))]
+async fn openclose_universal_transport_tls(
+    mut endpoint: EndPoint,
+    with_certificate_common_name: bool,
+    with_mtls: bool,
+) {
+    use zenoh_link_commons::tls::config::*;
+
+    zenoh_util::init_log_from_env_or("error");
+
+    let (ca, cert, key) = match with_certificate_common_name {
+        false => get_tls_certs(),
+        true => get_tls_certs_without_common_name(),
+    };
+
+    endpoint
+        .config_mut()
+        .extend_from_iter([(TLS_ROOT_CA_CERTIFICATE_RAW, ca)].into_iter())
+        .unwrap();
+
+    let mut listen_endpoint = endpoint.clone();
+    listen_endpoint
+        .config_mut()
+        .extend_from_iter(
+            [
+                (TLS_LISTEN_PRIVATE_KEY_RAW, key),
+                (TLS_LISTEN_CERTIFICATE_RAW, cert),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+    let mut connect_endpoint = endpoint;
+    if with_mtls {
+        listen_endpoint
+            .config_mut()
+            .extend_from_iter([(TLS_ENABLE_MTLS, "true")].into_iter())
+            .unwrap();
+        connect_endpoint
+            .config_mut()
+            .extend_from_iter(
+                [
+                    (TLS_CONNECT_PRIVATE_KEY_RAW, key),
+                    (TLS_CONNECT_CERTIFICATE_RAW, cert),
+                    (TLS_ENABLE_MTLS, "true"),
+                ]
+                .into_iter(),
+            )
+            .unwrap();
+    }
+
+    openclose_transport(&listen_endpoint, &connect_endpoint, false).await;
 }
 
 #[cfg(feature = "transport_tcp")]
-#[test]
-fn openclose_tcp_only() {
-    let _ = env_logger::try_init();
-    task::block_on(async {
-        zasync_executor_init!();
-    });
-
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openclose_tcp_only() {
+    zenoh_util::init_log_from_env_or("error");
     let endpoint: EndPoint = format!("tcp/127.0.0.1:{}", 13000).parse().unwrap();
-    task::block_on(openclose_universal_transport(&endpoint));
+    openclose_universal_transport(&endpoint).await;
 }
 
 #[cfg(feature = "transport_tcp")]
-#[test]
-fn openclose_tcp_only_with_lowlatency_transport() {
-    let _ = env_logger::try_init();
-    task::block_on(async {
-        zasync_executor_init!();
-    });
-
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openclose_tcp_only_with_lowlatency_transport() {
+    zenoh_util::init_log_from_env_or("error");
     let endpoint: EndPoint = format!("tcp/127.0.0.1:{}", 13100).parse().unwrap();
-    task::block_on(openclose_lowlatency_transport(&endpoint));
+    openclose_lowlatency_transport(&endpoint).await;
 }
 
 #[cfg(feature = "transport_udp")]
-#[test]
-fn openclose_udp_only() {
-    let _ = env_logger::try_init();
-    task::block_on(async {
-        zasync_executor_init!();
-    });
-
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openclose_udp_only() {
+    zenoh_util::init_log_from_env_or("error");
     let endpoint: EndPoint = format!("udp/127.0.0.1:{}", 13010).parse().unwrap();
-    task::block_on(openclose_universal_transport(&endpoint));
+    openclose_universal_transport(&endpoint).await;
 }
 
 #[cfg(feature = "transport_udp")]
-#[test]
-fn openclose_udp_only_with_lowlatency_transport() {
-    let _ = env_logger::try_init();
-    task::block_on(async {
-        zasync_executor_init!();
-    });
-
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openclose_udp_only_with_lowlatency_transport() {
+    zenoh_util::init_log_from_env_or("error");
     let endpoint: EndPoint = format!("udp/127.0.0.1:{}", 13110).parse().unwrap();
-    task::block_on(openclose_lowlatency_transport(&endpoint));
+    openclose_lowlatency_transport(&endpoint).await;
 }
 
 #[cfg(feature = "transport_ws")]
-#[test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
-fn openclose_ws_only() {
-    let _ = env_logger::try_init();
-    task::block_on(async {
-        zasync_executor_init!();
-    });
-
+async fn openclose_ws_only() {
+    zenoh_util::init_log_from_env_or("error");
     let endpoint: EndPoint = format!("ws/127.0.0.1:{}", 13020).parse().unwrap();
-    task::block_on(openclose_universal_transport(&endpoint));
+    openclose_universal_transport(&endpoint).await;
 }
 
 #[cfg(feature = "transport_ws")]
-#[test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
-fn openclose_ws_only_with_lowlatency_transport() {
-    let _ = env_logger::try_init();
-    task::block_on(async {
-        zasync_executor_init!();
-    });
-
+async fn openclose_ws_only_with_lowlatency_transport() {
+    zenoh_util::init_log_from_env_or("error");
     let endpoint: EndPoint = format!("ws/127.0.0.1:{}", 13120).parse().unwrap();
-    task::block_on(openclose_lowlatency_transport(&endpoint));
+    openclose_lowlatency_transport(&endpoint).await;
 }
 
 #[cfg(feature = "transport_unixpipe")]
-#[test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
-fn openclose_unixpipe_only() {
-    let _ = env_logger::try_init();
-    task::block_on(async {
-        zasync_executor_init!();
-    });
-
+async fn openclose_unixpipe_only() {
+    zenoh_util::init_log_from_env_or("error");
     let endpoint: EndPoint = "unixpipe/openclose_unixpipe_only".parse().unwrap();
-    task::block_on(openclose_universal_transport(&endpoint));
+    openclose_universal_transport(&endpoint).await;
 }
 
 #[cfg(feature = "transport_unixpipe")]
-#[test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
-fn openclose_unixpipe_only_with_lowlatency_transport() {
-    let _ = env_logger::try_init();
-    task::block_on(async {
-        zasync_executor_init!();
-    });
-
+async fn openclose_unixpipe_only_with_lowlatency_transport() {
+    zenoh_util::init_log_from_env_or("error");
     let endpoint: EndPoint = "unixpipe/openclose_unixpipe_only_with_lowlatency_transport"
         .parse()
         .unwrap();
-    task::block_on(openclose_lowlatency_transport(&endpoint));
+    openclose_lowlatency_transport(&endpoint).await;
 }
 
 #[cfg(all(feature = "transport_unixsock-stream", target_family = "unix"))]
-#[test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
-fn openclose_unix_only() {
-    let _ = env_logger::try_init();
-    task::block_on(async {
-        zasync_executor_init!();
-    });
-
+async fn openclose_unix_only() {
+    zenoh_util::init_log_from_env_or("error");
     let f1 = "zenoh-test-unix-socket-9.sock";
     let _ = std::fs::remove_file(f1);
     let endpoint: EndPoint = format!("unixsock-stream/{f1}").parse().unwrap();
-    task::block_on(openclose_universal_transport(&endpoint));
+    openclose_universal_transport(&endpoint).await;
     let _ = std::fs::remove_file(f1);
     let _ = std::fs::remove_file(format!("{f1}.lock"));
 }
 
 #[cfg(feature = "transport_tls")]
-#[test]
-fn openclose_tls_only() {
-    use zenoh_link::tls::config::*;
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openclose_tls_only() {
+    let endpoint: EndPoint = format!("tls/localhost:{}", 13030).parse().unwrap();
+    openclose_universal_transport_tls(endpoint, false, false).await;
+}
 
-    let _ = env_logger::try_init();
-    task::block_on(async {
-        zasync_executor_init!();
-    });
+#[cfg(feature = "transport_tls")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openclose_tls_only_with_mtls() {
+    let endpoint: EndPoint = format!("tls/localhost:{}", 13031).parse().unwrap();
+    openclose_universal_transport_tls(endpoint, false, true).await;
+}
 
-    // NOTE: this an auto-generated pair of certificate and key.
-    //       The target domain is localhost, so it has no real
-    //       mapping to any existing domain. The certificate and key
-    //       have been generated using: https://github.com/jsha/minica
-    let key = "-----BEGIN RSA PRIVATE KEY-----
-MIIEpAIBAAKCAQEAsfqAuhElN4HnyeqLovSd4Qe+nNv5AwCjSO+HFiF30x3vQ1Hi
-qRA0UmyFlSqBnFH3TUHm4Jcad40QfrX8f11NKGZdpvKHsMYqYjZnYkRFGS2s4fQy
-aDbV5M06s3UDX8ETPgY41Y8fCKTSVdi9iHkwcVrXMxUu4IBBx0C1r2GSo3gkIBnU
-cELdFdaUOSbdCipJhbnkwixEr2h7PXxwba7SIZgZtRaQWak1VE9b716qe3iMuMha
-Efo/UoFmeZCPu5spfwaOZsnCsxRPk2IjbzlsHTJ09lM9wmbEFHBMVAXejLTk++Sr
-Xt8jASZhNen/2GzyLQNAquGn98lCMQ6SsE9vLQIDAQABAoIBAGQkKggHm6Q20L+4
-2+bNsoOqguLplpvM4RMpyx11qWE9h6GeUmWD+5yg+SysJQ9aw0ZSHWEjRD4ePji9
-lxvm2IIxzuIftp+NcM2gBN2ywhpfq9XbO/2NVR6PJ0dQQJzBG12bzKDFDdYkP0EU
-WdiPL+WoEkvo0F57bAd77n6G7SZSgxYekBF+5S6rjbu5I1cEKW+r2vLehD4uFCVX
-Q0Tu7TyIOE1KJ2anRb7ZXVUaguNj0/Er7EDT1+wN8KJKvQ1tYGIq/UUBtkP9nkOI
-9XJd25k6m5AQPDddzd4W6/5+M7kjyVPi3CsQcpBPss6ueyecZOMaKqdWAHeEyaak
-r67TofUCgYEA6GBa+YkRvp0Ept8cd5mh4gCRM8wUuhtzTQnhubCPivy/QqMWScdn
-qD0OiARLAsqeoIfkAVgyqebVnxwTrKTvWe0JwpGylEVWQtpGz3oHgjST47yZxIiY
-CSAaimi2CYnJZ+QB2oBkFVwNCuXdPEGX6LgnOGva19UKrm6ONsy6V9MCgYEAxBJu
-fu4dGXZreARKEHa/7SQjI9ayAFuACFlON/EgSlICzQyG/pumv1FsMEiFrv6w7PRj
-4AGqzyzGKXWVDRMrUNVeGPSKJSmlPGNqXfPaXRpVEeB7UQhAs5wyMrWDl8jEW7Ih
-XcWhMLn1f/NOAKyrSDSEaEM+Nuu+xTifoAghvP8CgYEAlta9Fw+nihDIjT10cBo0
-38w4dOP7bFcXQCGy+WMnujOYPzw34opiue1wOlB3FIfL8i5jjY/fyzPA5PhHuSCT
-Ec9xL3B9+AsOFHU108XFi/pvKTwqoE1+SyYgtEmGKKjdKOfzYA9JaCgJe1J8inmV
-jwXCx7gTJVjwBwxSmjXIm+sCgYBQF8NhQD1M0G3YCdCDZy7BXRippCL0OGxVfL2R
-5oKtOVEBl9NxH/3+evE5y/Yn5Mw7Dx3ZPHUcygpslyZ6v9Da5T3Z7dKcmaVwxJ+H
-n3wcugv0EIHvOPLNK8npovINR6rGVj6BAqD0uZHKYYYEioQxK5rGyGkaoDQ+dgHm
-qku12wKBgQDem5FvNp5iW7mufkPZMqf3sEGtu612QeqejIPFM1z7VkUgetsgPBXD
-tYsqC2FtWzY51VOEKNpnfH7zH5n+bjoI9nAEAW63TK9ZKkr2hRGsDhJdGzmLfQ7v
-F6/CuIw9EsAq6qIB8O88FXQqald+BZOx6AzB8Oedsz/WtMmIEmr/+Q==
------END RSA PRIVATE KEY-----";
+#[cfg(feature = "transport_tls")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openclose_tls_only_with_no_common_name() {
+    let endpoint: EndPoint = format!("tls/localhost:{}", 13032).parse().unwrap();
+    openclose_universal_transport_tls(endpoint, true, false).await;
+}
 
-    let cert = "-----BEGIN CERTIFICATE-----
-MIIDLjCCAhagAwIBAgIIeUtmIdFQznMwDQYJKoZIhvcNAQELBQAwIDEeMBwGA1UE
-AxMVbWluaWNhIHJvb3QgY2EgMDc4ZGE3MCAXDTIzMDMwNjE2MDMxOFoYDzIxMjMw
-MzA2MTYwMzE4WjAUMRIwEAYDVQQDEwlsb2NhbGhvc3QwggEiMA0GCSqGSIb3DQEB
-AQUAA4IBDwAwggEKAoIBAQCx+oC6ESU3gefJ6oui9J3hB76c2/kDAKNI74cWIXfT
-He9DUeKpEDRSbIWVKoGcUfdNQebglxp3jRB+tfx/XU0oZl2m8oewxipiNmdiREUZ
-Lazh9DJoNtXkzTqzdQNfwRM+BjjVjx8IpNJV2L2IeTBxWtczFS7ggEHHQLWvYZKj
-eCQgGdRwQt0V1pQ5Jt0KKkmFueTCLESvaHs9fHBtrtIhmBm1FpBZqTVUT1vvXqp7
-eIy4yFoR+j9SgWZ5kI+7myl/Bo5mycKzFE+TYiNvOWwdMnT2Uz3CZsQUcExUBd6M
-tOT75Kte3yMBJmE16f/YbPItA0Cq4af3yUIxDpKwT28tAgMBAAGjdjB0MA4GA1Ud
-DwEB/wQEAwIFoDAdBgNVHSUEFjAUBggrBgEFBQcDAQYIKwYBBQUHAwIwDAYDVR0T
-AQH/BAIwADAfBgNVHSMEGDAWgBTWfAmQ/BUIQm/9/llJJs2jUMWzGzAUBgNVHREE
-DTALgglsb2NhbGhvc3QwDQYJKoZIhvcNAQELBQADggEBAG/POnBob0S7iYwsbtI2
-3LTTbRnmseIErtJuJmI9yYzgVIm6sUSKhlIUfAIm4rfRuzE94KFeWR2w9RabxOJD
-wjYLLKvQ6rFY5g2AV/J0TwDjYuq0absdaDPZ8MKJ+/lpGYK3Te+CTOfq5FJRFt1q
-GOkXAxnNpGg0obeRWRKFiAMHbcw6a8LIMfRjCooo3+uSQGsbVzGxSB4CYo720KcC
-9vB1K9XALwzoqCewP4aiQsMY1GWpAmzXJftY3w+lka0e9dBYcdEdOqxSoZb5OBBZ
-p5e60QweRuJsb60aUaCG8HoICevXYK2fFqCQdlb5sIqQqXyN2K6HuKAFywsjsGyJ
-abY=
------END CERTIFICATE-----";
-
-    // Configure the client
-    let ca = "-----BEGIN CERTIFICATE-----
-MIIDSzCCAjOgAwIBAgIIB42n1ZIkOakwDQYJKoZIhvcNAQELBQAwIDEeMBwGA1UE
-AxMVbWluaWNhIHJvb3QgY2EgMDc4ZGE3MCAXDTIzMDMwNjE2MDMwN1oYDzIxMjMw
-MzA2MTYwMzA3WjAgMR4wHAYDVQQDExVtaW5pY2Egcm9vdCBjYSAwNzhkYTcwggEi
-MA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDIuCq24O4P4Aep5vAVlrIQ7P8+
-uWWgcHIFYa02TmhBUB/hjo0JANCQvAtpVNuQ8NyKPlqnnq1cttePbSYVeA0rrnOs
-DcfySAiyGBEY9zMjFfHJtH1wtrPcJEU8XIEY3xUlrAJE2CEuV9dVYgfEEydnvgLc
-8Ug0WXSiARjqbnMW3l8jh6bYCp/UpL/gSM4mxdKrgpfyPoweGhlOWXc3RTS7cqM9
-T25acURGOSI6/g8GF0sNE4VZmUvHggSTmsbLeXMJzxDWO+xVehRmbQx3IkG7u++b
-QdRwGIJcDNn7zHlDMHtQ0Z1DBV94fZNBwCULhCBB5g20XTGw//S7Fj2FPwyhAgMB
-AAGjgYYwgYMwDgYDVR0PAQH/BAQDAgKEMB0GA1UdJQQWMBQGCCsGAQUFBwMBBggr
-BgEFBQcDAjASBgNVHRMBAf8ECDAGAQH/AgEAMB0GA1UdDgQWBBTWfAmQ/BUIQm/9
-/llJJs2jUMWzGzAfBgNVHSMEGDAWgBTWfAmQ/BUIQm/9/llJJs2jUMWzGzANBgkq
-hkiG9w0BAQsFAAOCAQEAvtcZFAELKiTuOiAeYts6zeKxc+nnHCzayDeD/BDCbxGJ
-e1n+xdHjLtWGd+/Anc+fvftSYBPTFQqCi84lPiUIln5z/rUxE+ke81hNPIfw2obc
-yIg87xCabQpVyEh8s+MV+7YPQ1+fH4FuSi2Fck1FejxkVqN2uOZPvOYUmSTsaVr1
-8SfRnwJNZ9UMRPM2bD4Jkvj0VcL42JM3QkOClOzYW4j/vll2cSs4kx7er27cIoo1
-Ck0v2xSPAiVjg6w65rUQeW6uB5m0T2wyj+wm0At8vzhZPlgS1fKhcmT2dzOq3+oN
-R+IdLiXcyIkg0m9N8I17p0ljCSkbrgGMD3bbePRTfg==
------END CERTIFICATE-----";
-
-    let mut endpoint: EndPoint = format!("tls/localhost:{}", 13030).parse().unwrap();
-    endpoint
-        .config_mut()
-        .extend(
-            [
-                (TLS_ROOT_CA_CERTIFICATE_RAW, ca),
-                (TLS_SERVER_PRIVATE_KEY_RAW, key),
-                (TLS_SERVER_CERTIFICATE_RAW, cert),
-            ]
-            .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
-        )
-        .unwrap();
-
-    task::block_on(openclose_universal_transport(&endpoint));
+#[cfg(feature = "transport_tls")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openclose_tls_only_with_mtls_and_no_common_name() {
+    let endpoint: EndPoint = format!("tls/localhost:{}", 13033).parse().unwrap();
+    openclose_universal_transport_tls(endpoint, true, true).await;
 }
 
 #[cfg(feature = "transport_quic")]
-#[test]
-fn openclose_quic_only() {
-    use zenoh_link::quic::config::*;
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openclose_quic_only() {
+    let endpoint: EndPoint = format!("quic/localhost:{}", 13040).parse().unwrap();
+    openclose_universal_transport_tls(endpoint, false, false).await;
+}
 
-    task::block_on(async {
-        zasync_executor_init!();
-    });
+#[cfg(feature = "transport_quic")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openclose_quic_only_with_mtls() {
+    let endpoint: EndPoint = format!("quic/localhost:{}", 13041).parse().unwrap();
+    openclose_universal_transport_tls(endpoint, false, true).await;
+}
 
+#[cfg(feature = "transport_quic")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openclose_quic_only_with_no_common_name() {
+    let endpoint: EndPoint = format!("quic/localhost:{}", 13042).parse().unwrap();
+    openclose_universal_transport_tls(endpoint, true, false).await;
+}
+
+#[cfg(feature = "transport_quic")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openclose_quic_only_with_mtls_and_no_common_name() {
+    let endpoint: EndPoint = format!("quic/localhost:{}", 13043).parse().unwrap();
+    openclose_universal_transport_tls(endpoint, true, true).await;
+}
+
+#[cfg(feature = "transport_tcp")]
+#[cfg(target_os = "linux")]
+#[should_panic(expected = "Elapsed")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openclose_tcp_only_connect_with_interface_restriction() {
+    let addrs = get_ipv4_ipaddrs(None);
+
+    zenoh_util::init_log_from_env_or("error");
+
+    let listen_endpoint: EndPoint = format!("tcp/{}:{}", addrs[0], 13001).parse().unwrap();
+
+    let connect_endpoint: EndPoint = format!("tcp/{}:{}#iface=lo", addrs[0], 13001)
+        .parse()
+        .unwrap();
+
+    // should not connect to local interface and external address
+    openclose_transport(&listen_endpoint, &connect_endpoint, false).await;
+}
+
+#[cfg(feature = "transport_tcp")]
+#[cfg(target_os = "linux")]
+#[should_panic(expected = "assertion failed: open_res.is_ok()")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openclose_tcp_only_listen_with_interface_restriction() {
+    let addrs = get_ipv4_ipaddrs(None);
+
+    zenoh_util::init_log_from_env_or("error");
+
+    let listen_endpoint: EndPoint = format!("tcp/{}:{}#iface=lo", addrs[0], 13002)
+        .parse()
+        .unwrap();
+
+    let connect_endpoint: EndPoint = format!("tcp/{}:{}", addrs[0], 13002).parse().unwrap();
+
+    // should not connect to local interface and external address
+    openclose_transport(&listen_endpoint, &connect_endpoint, false).await;
+}
+
+#[cfg(feature = "transport_udp")]
+#[cfg(target_os = "linux")]
+#[should_panic(expected = "Elapsed")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openclose_udp_only_connect_with_interface_restriction() {
+    let addrs = get_ipv4_ipaddrs(None);
+
+    zenoh_util::init_log_from_env_or("error");
+
+    let listen_endpoint: EndPoint = format!("udp/{}:{}", addrs[0], 13004).parse().unwrap();
+
+    let connect_endpoint: EndPoint = format!("udp/{}:{}#iface=lo", addrs[0], 13004)
+        .parse()
+        .unwrap();
+
+    // should not connect to local interface and external address
+    openclose_transport(&listen_endpoint, &connect_endpoint, false).await;
+}
+
+#[cfg(feature = "transport_udp")]
+#[cfg(target_os = "linux")]
+#[should_panic(expected = "Elapsed")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openclose_udp_only_listen_with_interface_restriction() {
+    let addrs = get_ipv4_ipaddrs(None);
+
+    zenoh_util::init_log_from_env_or("error");
+    let listen_endpoint: EndPoint = format!("udp/{}:{}#iface=lo", addrs[0], 13005)
+        .parse()
+        .unwrap();
+
+    let connect_endpoint: EndPoint = format!("udp/{}:{}", addrs[0], 13005).parse().unwrap();
+
+    // should not connect to local interface and external address
+    openclose_transport(&listen_endpoint, &connect_endpoint, false).await;
+}
+
+#[cfg(all(feature = "transport_vsock", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openclose_vsock() {
+    zenoh_util::init_log_from_env_or("error");
+    let endpoint: EndPoint = "vsock/VMADDR_CID_LOCAL:17000".parse().unwrap();
+    openclose_lowlatency_transport(&endpoint).await;
+}
+
+#[cfg(feature = "transport_quic")]
+#[cfg(target_os = "linux")]
+#[should_panic(expected = "Elapsed")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openclose_quic_only_connect_with_interface_restriction() {
+    use zenoh_link_commons::tls::config::*;
+
+    zenoh_util::init_log_from_env_or("error");
+    let addrs = get_ipv4_ipaddrs(None);
+    let (ca, cert, key) = get_tls_certs();
+
+    let mut listen_endpoint: EndPoint = format!("quic/{}:{}", addrs[0], 13006).parse().unwrap();
+    listen_endpoint
+        .config_mut()
+        .extend_from_iter(
+            [
+                (TLS_ROOT_CA_CERTIFICATE_RAW, ca),
+                (TLS_LISTEN_PRIVATE_KEY_RAW, key),
+                (TLS_LISTEN_CERTIFICATE_RAW, cert),
+            ]
+            .iter()
+            .copied(),
+        )
+        .unwrap();
+
+    let connect_endpoint: EndPoint = format!("quic/{}:{}#iface=lo", addrs[0], 13006)
+        .parse()
+        .unwrap();
+
+    // should not connect to local interface and external address
+    openclose_transport(&listen_endpoint, &connect_endpoint, false).await;
+}
+
+#[cfg(feature = "transport_quic")]
+#[cfg(target_os = "linux")]
+#[should_panic(expected = "Elapsed")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openclose_quic_only_listen_with_interface_restriction() {
+    use zenoh_link_commons::tls::config::*;
+
+    zenoh_util::init_log_from_env_or("error");
+    let addrs = get_ipv4_ipaddrs(None);
+    let (ca, cert, key) = get_tls_certs();
+
+    let mut listen_endpoint: EndPoint = format!("quic/{}:{}#iface=lo", addrs[0], 13007)
+        .parse()
+        .unwrap();
+    listen_endpoint
+        .config_mut()
+        .extend_from_iter(
+            [
+                (TLS_ROOT_CA_CERTIFICATE_RAW, ca),
+                (TLS_LISTEN_PRIVATE_KEY_RAW, key),
+                (TLS_LISTEN_CERTIFICATE_RAW, cert),
+            ]
+            .iter()
+            .copied(),
+        )
+        .unwrap();
+
+    let connect_endpoint: EndPoint = format!("quic/{}:{}", addrs[0], 13007).parse().unwrap();
+
+    // should not connect to local interface and external address
+    openclose_transport(&listen_endpoint, &connect_endpoint, false).await;
+}
+
+#[cfg(feature = "transport_tls")]
+#[cfg(target_os = "linux")]
+#[should_panic(expected = "Elapsed")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openclose_tls_only_connect_with_interface_restriction() {
+    use zenoh_link_commons::tls::config::*;
+
+    zenoh_util::init_log_from_env_or("error");
+    let addrs = get_ipv4_ipaddrs(None);
+    let (ca, cert, key) = get_tls_certs();
+
+    let mut listen_endpoint: EndPoint = format!("tls/{}:{}", addrs[0], 13008).parse().unwrap();
+    listen_endpoint
+        .config_mut()
+        .extend_from_iter(
+            [
+                (TLS_ROOT_CA_CERTIFICATE_RAW, ca),
+                (TLS_LISTEN_PRIVATE_KEY_RAW, key),
+                (TLS_LISTEN_CERTIFICATE_RAW, cert),
+            ]
+            .iter()
+            .copied(),
+        )
+        .unwrap();
+
+    let connect_endpoint: EndPoint = format!("tls/{}:{}#iface=lo", addrs[0], 13008)
+        .parse()
+        .unwrap();
+
+    // should not connect to local interface and external address
+    openclose_transport(&listen_endpoint, &connect_endpoint, false).await;
+}
+
+#[cfg(feature = "transport_tls")]
+#[cfg(target_os = "linux")]
+#[should_panic(expected = "assertion failed: open_res.is_ok()")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openclose_tls_only_listen_with_interface_restriction() {
+    use zenoh_link_commons::tls::config::*;
+
+    zenoh_util::init_log_from_env_or("error");
+    let addrs = get_ipv4_ipaddrs(None);
+    let (ca, cert, key) = get_tls_certs();
+
+    let mut listen_endpoint: EndPoint = format!("tls/{}:{}#iface=lo", addrs[0], 13009)
+        .parse()
+        .unwrap();
+    listen_endpoint
+        .config_mut()
+        .extend_from_iter(
+            [
+                (TLS_ROOT_CA_CERTIFICATE_RAW, ca),
+                (TLS_LISTEN_PRIVATE_KEY_RAW, key),
+                (TLS_LISTEN_CERTIFICATE_RAW, cert),
+            ]
+            .iter()
+            .copied(),
+        )
+        .unwrap();
+
+    let connect_endpoint: EndPoint = format!("tls/{}:{}", addrs[0], 13009).parse().unwrap();
+
+    // should not connect to local interface and external address
+    openclose_transport(&listen_endpoint, &connect_endpoint, false).await;
+}
+
+fn get_tls_certs() -> (&'static str, &'static str, &'static str) {
     // NOTE: this an auto-generated pair of certificate and key.
     //       The target domain is localhost, so it has no real
     //       mapping to any existing domain. The certificate and key
@@ -769,20 +950,54 @@ Ck0v2xSPAiVjg6w65rUQeW6uB5m0T2wyj+wm0At8vzhZPlgS1fKhcmT2dzOq3+oN
 R+IdLiXcyIkg0m9N8I17p0ljCSkbrgGMD3bbePRTfg==
 -----END CERTIFICATE-----";
 
-    // Define the locator
-    let mut endpoint: EndPoint = format!("quic/localhost:{}", 13040).parse().unwrap();
-    endpoint
-        .config_mut()
-        .extend(
-            [
-                (TLS_ROOT_CA_CERTIFICATE_RAW, ca),
-                (TLS_SERVER_PRIVATE_KEY_RAW, key),
-                (TLS_SERVER_CERTIFICATE_RAW, cert),
-            ]
-            .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
-        )
-        .unwrap();
+    (ca, cert, key)
+}
 
-    task::block_on(openclose_universal_transport(&endpoint));
+#[cfg(any(feature = "transport_tls", feature = "transport_quic"))]
+const fn get_tls_certs_without_common_name() -> (&'static str, &'static str, &'static str) {
+    // NOTE: this an auto-generated pair of certificate and key.
+    //       The target domain is localhost, so it has no real
+    //       mapping to any existing domain.
+    //
+    //       minica does not currently support generating
+    //       certificates without a Common Name, so this was
+    //       generated using OpenSSL with the following commands:
+    //           openssl req -new -x509 -noenc -days 365000 -batch -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -sha384 -keyout ca-key.pem -out ca.pem
+    //           openssl req -new -x509 -noenc -days 365000 -batch -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -sha384 -keyout server-key.pem -out server-cert.pem -CA ca.pem -CAkey ca-key.pem -addext "authorityKeyIdentifier=keyid,issuer" -addext "basicConstraints=CA:FALSE" -addext "subjectAltName=DNS:localhost" -addext "extendedKeyUsage=serverAuth,clientAuth"
+
+    const SERVER_KEY_NO_CN: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgK7z8MHmX75qSSGh9
+4wpqRXA0d3Bsb5tFp9kqHmmCYwuhRANCAAQhiWwnr2iHk/bV86RMYfuntz4o+gPH
+ayFAA6DbVZnxvNz4MxY889I7HSrD5iqtO8iaxlQeavx9F1Ff73agYgBj
+-----END PRIVATE KEY-----";
+
+    const SERVER_CERT_NO_CN: &str = "-----BEGIN CERTIFICATE-----
+MIICEjCCAbigAwIBAgIUK+gTxmEapjy9K2AOKy+FaWkjACkwCgYIKoZIzj0EAwMw
+RTELMAkGA1UEBhMCQVUxEzARBgNVBAgMClNvbWUtU3RhdGUxITAfBgNVBAoMGElu
+dGVybmV0IFdpZGdpdHMgUHR5IEx0ZDAgFw0yNjAyMDUxMjQ5MTNaGA8zMDI1MDYw
+ODEyNDkxM1owRTELMAkGA1UEBhMCQVUxEzARBgNVBAgMClNvbWUtU3RhdGUxITAf
+BgNVBAoMGEludGVybmV0IFdpZGdpdHMgUHR5IEx0ZDBZMBMGByqGSM49AgEGCCqG
+SM49AwEHA0IABCGJbCevaIeT9tXzpExh+6e3Pij6A8drIUADoNtVmfG83PgzFjzz
+0jsdKsPmKq07yJrGVB5q/H0XUV/vdqBiAGOjgYMwgYAwHQYDVR0OBBYEFITqkHg7
+V7s6YEFEjayZ1x0nZ7yVMB8GA1UdIwQYMBaAFC1uOxD1e2c3O9JWFJpbYrk+VQ99
+MAkGA1UdEwQCMAAwFAYDVR0RBA0wC4IJbG9jYWxob3N0MB0GA1UdJQQWMBQGCCsG
+AQUFBwMBBggrBgEFBQcDAjAKBggqhkjOPQQDAwNIADBFAiARmqtIYRygkWrMZg6j
+kYikJVUysUelvUMRfljBCbB1jgIhALzl57XtBhJ+QVy5jNMKjU6s9yfCvnzZPTpk
+3Z0eRdp3
+-----END CERTIFICATE-----";
+
+    const SERVER_CA_NO_CN: &str = "-----BEGIN CERTIFICATE-----
+MIIB4DCCAYegAwIBAgIUVaRwyx5e+C+ZVCMYh11Smkf596kwCgYIKoZIzj0EAwMw
+RTELMAkGA1UEBhMCQVUxEzARBgNVBAgMClNvbWUtU3RhdGUxITAfBgNVBAoMGElu
+dGVybmV0IFdpZGdpdHMgUHR5IEx0ZDAgFw0yNjAyMDUxMjQ5MTNaGA8zMDI1MDYw
+ODEyNDkxM1owRTELMAkGA1UEBhMCQVUxEzARBgNVBAgMClNvbWUtU3RhdGUxITAf
+BgNVBAoMGEludGVybmV0IFdpZGdpdHMgUHR5IEx0ZDBZMBMGByqGSM49AgEGCCqG
+SM49AwEHA0IABAmwRasT0VNT640z3AsZ51uV9YplwGvJ5dbnCqPw3Rrcup8cSUB0
+UAun3bQTOXp/5Xe6dwanBdNbzHkHLRzD1lajUzBRMB0GA1UdDgQWBBQtbjsQ9Xtn
+NzvSVhSaW2K5PlUPfTAfBgNVHSMEGDAWgBQtbjsQ9XtnNzvSVhSaW2K5PlUPfTAP
+BgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMDA0cAMEQCIEwCMydwyjYB8OWHL/3s
+WbTOA/3LtgGrXHq9LzGrHv1JAiBdLXw1r42i5Ttsa6yYDNFHde2MQaIlPhToOkta
+IEGASQ==
+-----END CERTIFICATE-----";
+    (SERVER_CA_NO_CN, SERVER_CERT_NO_CN, SERVER_KEY_NO_CN)
 }

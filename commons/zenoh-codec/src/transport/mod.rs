@@ -14,14 +14,13 @@
 pub mod batch;
 mod close;
 mod fragment;
-mod frame;
+pub mod frame;
 mod init;
 mod join;
 mod keepalive;
 mod oam;
 mod open;
 
-use crate::{RCodec, WCodec, Zenoh080, Zenoh080Header};
 use zenoh_buffers::{
     reader::{BacktrackableReader, DidntRead, Reader},
     writer::{DidntWrite, Writer},
@@ -32,20 +31,22 @@ use zenoh_protocol::{
     transport::*,
 };
 
+use crate::{RCodec, WCodec, Zenoh080, Zenoh080Header};
+
 // TransportMessageLowLatency
-impl<W> WCodec<&TransportMessageLowLatency, &mut W> for Zenoh080
+impl<W> WCodec<TransportMessageLowLatencyRef<'_>, &mut W> for Zenoh080
 where
     W: Writer,
 {
     type Output = Result<(), DidntWrite>;
 
-    fn write(self, writer: &mut W, x: &TransportMessageLowLatency) -> Self::Output {
-        let TransportMessageLowLatency { body } = x;
+    fn write(self, writer: &mut W, x: TransportMessageLowLatencyRef) -> Self::Output {
+        let TransportMessageLowLatencyRef { body } = x;
 
         match body {
-            TransportBodyLowLatency::Network(b) => self.write(&mut *writer, b),
-            TransportBodyLowLatency::KeepAlive(b) => self.write(&mut *writer, b),
-            TransportBodyLowLatency::Close(b) => self.write(&mut *writer, b),
+            TransportBodyLowLatencyRef::Network(b) => self.write(&mut *writer, b),
+            TransportBodyLowLatencyRef::KeepAlive(b) => self.write(&mut *writer, &b),
+            TransportBodyLowLatencyRef::Close(b) => self.write(&mut *writer, &b),
         }
     }
 }
@@ -171,6 +172,46 @@ where
     type Error = DidntRead;
 
     fn read(self, reader: &mut R) -> Result<(ext::QoSType<{ ID }>, bool), Self::Error> {
+        let (ext, more): (ZExtZ64<{ ID }>, bool) = self.read(&mut *reader)?;
+        Ok((ext.into(), more))
+    }
+}
+
+// Extensions: Patch
+impl<W, const ID: u8> WCodec<(ext::PatchType<{ ID }>, bool), &mut W> for Zenoh080
+where
+    W: Writer,
+{
+    type Output = Result<(), DidntWrite>;
+
+    fn write(self, writer: &mut W, x: (ext::PatchType<{ ID }>, bool)) -> Self::Output {
+        let (x, more) = x;
+        let ext: ZExtZ64<{ ID }> = x.into();
+
+        self.write(&mut *writer, (&ext, more))
+    }
+}
+
+impl<R, const ID: u8> RCodec<(ext::PatchType<{ ID }>, bool), &mut R> for Zenoh080
+where
+    R: Reader,
+{
+    type Error = DidntRead;
+
+    fn read(self, reader: &mut R) -> Result<(ext::PatchType<{ ID }>, bool), Self::Error> {
+        let header: u8 = self.read(&mut *reader)?;
+        let codec = Zenoh080Header::new(header);
+        codec.read(reader)
+    }
+}
+
+impl<R, const ID: u8> RCodec<(ext::PatchType<{ ID }>, bool), &mut R> for Zenoh080Header
+where
+    R: Reader,
+{
+    type Error = DidntRead;
+
+    fn read(self, reader: &mut R) -> Result<(ext::PatchType<{ ID }>, bool), Self::Error> {
         let (ext, more): (ZExtZ64<{ ID }>, bool) = self.read(&mut *reader)?;
         Ok((ext.into(), more))
     }

@@ -11,7 +11,6 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use super::transport::TransportUnicastLowlatency;
 use zenoh_buffers::{
     reader::{HasReader, Reader},
     ZSlice,
@@ -19,8 +18,10 @@ use zenoh_buffers::{
 use zenoh_codec::{RCodec, Zenoh080};
 use zenoh_core::zread;
 use zenoh_link::LinkUnicast;
-use zenoh_protocol::{network::NetworkMessage, transport::TransportMessageLowLatency};
+use zenoh_protocol::{network::NetworkMessageMut, transport::TransportMessageLowLatency};
 use zenoh_result::{zerror, ZResult};
+
+use super::transport::TransportUnicastLowlatency;
 
 /*************************************/
 /*            TRANSPORT RX           */
@@ -29,19 +30,30 @@ impl TransportUnicastLowlatency {
     fn trigger_callback(
         &self,
         #[allow(unused_mut)] // shared-memory feature requires mut
-        mut msg: NetworkMessage,
+        mut msg: NetworkMessageMut,
+        #[cfg(feature = "stats")] stats: &zenoh_stats::LinkStats,
     ) -> ZResult<()> {
         let callback = zread!(self.callback).clone();
         if let Some(callback) = callback.as_ref() {
+            #[cfg(feature = "stats")]
+            stats.inc_network_message(
+                zenoh_stats::Rx,
+                zenoh_protocol::network::NetworkMessageExt::as_ref(&msg),
+            );
             #[cfg(feature = "shared-memory")]
             {
-                if self.config.is_shm {
-                    crate::shm::map_zmsg_to_shmbuf(&mut msg, &self.manager.shm().reader)?;
+                if let Some(shm_context) = &self.shm_context {
+                    if let Err(e) =
+                        crate::shm::map_zmsg_to_shmbuf(msg.as_mut(), &shm_context.shm_reader)
+                    {
+                        tracing::debug!("Error receiving SHM buffer: {e}");
+                        return Ok(());
+                    }
                 }
             }
             callback.handle_message(msg)
         } else {
-            log::debug!(
+            tracing::debug!(
                 "Transport: {}. No callback available, dropping message: {}",
                 self.config.zid,
                 msg
@@ -54,6 +66,7 @@ impl TransportUnicastLowlatency {
         &self,
         mut zslice: ZSlice,
         link: &LinkUnicast,
+        #[cfg(feature = "stats")] stats: &zenoh_stats::LinkStats,
     ) -> ZResult<()> {
         let codec = Zenoh080::new();
         let mut reader = zslice.reader();
@@ -62,20 +75,27 @@ impl TransportUnicastLowlatency {
                 .read(&mut reader)
                 .map_err(|_| zerror!("{}: decoding error", link))?;
 
-            log::trace!("Received: {:?}", msg);
+            tracing::trace!("Received: {:?}", msg);
 
             #[cfg(feature = "stats")]
-            {
-                self.stats.inc_rx_t_msgs(1);
-            }
+            stats.inc_transport_message(zenoh_stats::Rx, 1);
 
             match msg.body {
                 zenoh_protocol::transport::TransportBodyLowLatency::Close(_) => {
-                    let _ = self.delete().await;
+                    // Spawn a task to avoid a deadlock waiting for this same task
+                    // to finish in the link close() joining the rx handle
+                    let c_transport = self.clone();
+                    zenoh_runtime::ZRuntime::Net.spawn(async move {
+                        let _ = c_transport.delete().await;
+                    });
                 }
                 zenoh_protocol::transport::TransportBodyLowLatency::KeepAlive(_) => {}
-                zenoh_protocol::transport::TransportBodyLowLatency::Network(msg) => {
-                    let _ = self.trigger_callback(msg);
+                zenoh_protocol::transport::TransportBodyLowLatency::Network(mut msg) => {
+                    let _ = self.trigger_callback(
+                        msg.as_mut(),
+                        #[cfg(feature = "stats")]
+                        stats,
+                    );
                 }
             }
         }

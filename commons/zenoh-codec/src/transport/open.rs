@@ -11,8 +11,8 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::{common::extension, RCodec, WCodec, Zenoh080, Zenoh080Header};
 use core::time::Duration;
+
 use zenoh_buffers::{
     reader::{DidntRead, Reader},
     writer::{DidntWrite, Writer},
@@ -27,6 +27,8 @@ use zenoh_protocol::{
     },
 };
 
+use crate::{common::extension, RCodec, WCodec, Zenoh080, Zenoh080Header};
+
 // OpenSyn
 impl<W> WCodec<&OpenSyn, &mut W> for Zenoh080
 where
@@ -40,11 +42,13 @@ where
             initial_sn,
             cookie,
             ext_qos,
+            #[cfg(feature = "shared-memory")]
             ext_shm,
             ext_auth,
             ext_mlink,
             ext_lowlatency,
             ext_compression,
+            ext_south,
         } = x;
 
         // Header
@@ -53,11 +57,17 @@ where
             header |= flag::T;
         }
         let mut n_exts = (ext_qos.is_some() as u8)
-            + (ext_shm.is_some() as u8)
             + (ext_auth.is_some() as u8)
             + (ext_mlink.is_some() as u8)
             + (ext_lowlatency.is_some() as u8)
-            + (ext_compression.is_some() as u8);
+            + (ext_compression.is_some() as u8)
+            + (ext_south.is_some() as u8);
+
+        #[cfg(feature = "shared-memory")]
+        {
+            n_exts += ext_shm.is_some() as u8;
+        }
+
         if n_exts != 0 {
             header |= flag::Z;
         }
@@ -77,6 +87,7 @@ where
             n_exts -= 1;
             self.write(&mut *writer, (qos, n_exts != 0))?;
         }
+        #[cfg(feature = "shared-memory")]
         if let Some(shm) = ext_shm.as_ref() {
             n_exts -= 1;
             self.write(&mut *writer, (shm, n_exts != 0))?;
@@ -96,6 +107,10 @@ where
         if let Some(compression) = ext_compression.as_ref() {
             n_exts -= 1;
             self.write(&mut *writer, (compression, n_exts != 0))?;
+        }
+        if let Some(south) = ext_south.as_ref() {
+            n_exts -= 1;
+            self.write(&mut *writer, (south, n_exts != 0))?;
         }
 
         Ok(())
@@ -138,11 +153,13 @@ where
 
         // Extensions
         let mut ext_qos = None;
+        #[cfg(feature = "shared-memory")]
         let mut ext_shm = None;
         let mut ext_auth = None;
         let mut ext_mlink = None;
         let mut ext_lowlatency = None;
         let mut ext_compression = None;
+        let mut ext_south = None;
 
         let mut has_ext = imsg::has_flag(self.header, flag::Z);
         while has_ext {
@@ -154,6 +171,7 @@ where
                     ext_qos = Some(q);
                     has_ext = ext;
                 }
+                #[cfg(feature = "shared-memory")]
                 ext::Shm::ID => {
                     let (s, ext): (ext::Shm, bool) = eodec.read(&mut *reader)?;
                     ext_shm = Some(s);
@@ -179,6 +197,11 @@ where
                     ext_compression = Some(q);
                     has_ext = ext;
                 }
+                ext::RemoteBound::ID => {
+                    let (q, ext): (ext::RemoteBound, bool) = eodec.read(&mut *reader)?;
+                    ext_south = Some(q);
+                    has_ext = ext;
+                }
                 _ => {
                     has_ext = extension::skip(reader, "OpenSyn", ext)?;
                 }
@@ -190,11 +213,13 @@ where
             initial_sn,
             cookie,
             ext_qos,
+            #[cfg(feature = "shared-memory")]
             ext_shm,
             ext_auth,
             ext_mlink,
             ext_lowlatency,
             ext_compression,
+            ext_south,
         })
     }
 }
@@ -211,11 +236,13 @@ where
             lease,
             initial_sn,
             ext_qos,
+            #[cfg(feature = "shared-memory")]
             ext_shm,
             ext_auth,
             ext_mlink,
             ext_lowlatency,
             ext_compression,
+            ext_south,
         } = x;
 
         // Header
@@ -226,11 +253,17 @@ where
             header |= flag::T;
         }
         let mut n_exts = (ext_qos.is_some() as u8)
-            + (ext_shm.is_some() as u8)
             + (ext_auth.is_some() as u8)
             + (ext_mlink.is_some() as u8)
             + (ext_lowlatency.is_some() as u8)
-            + (ext_compression.is_some() as u8);
+            + (ext_compression.is_some() as u8)
+            + (ext_south.is_some() as u8);
+
+        #[cfg(feature = "shared-memory")]
+        {
+            n_exts += ext_shm.is_some() as u8;
+        }
+
         if n_exts != 0 {
             header |= flag::Z;
         }
@@ -249,6 +282,7 @@ where
             n_exts -= 1;
             self.write(&mut *writer, (qos, n_exts != 0))?;
         }
+        #[cfg(feature = "shared-memory")]
         if let Some(shm) = ext_shm.as_ref() {
             n_exts -= 1;
             self.write(&mut *writer, (shm, n_exts != 0))?;
@@ -268,6 +302,10 @@ where
         if let Some(compression) = ext_compression.as_ref() {
             n_exts -= 1;
             self.write(&mut *writer, (compression, n_exts != 0))?;
+        }
+        if let Some(south) = ext_south.as_ref() {
+            n_exts -= 1;
+            self.write(&mut *writer, (south, n_exts != 0))?;
         }
 
         Ok(())
@@ -309,11 +347,13 @@ where
 
         // Extensions
         let mut ext_qos = None;
+        #[cfg(feature = "shared-memory")]
         let mut ext_shm = None;
         let mut ext_auth = None;
         let mut ext_mlink = None;
         let mut ext_lowlatency = None;
         let mut ext_compression = None;
+        let mut ext_south = None;
 
         let mut has_ext = imsg::has_flag(self.header, flag::Z);
         while has_ext {
@@ -325,6 +365,7 @@ where
                     ext_qos = Some(q);
                     has_ext = ext;
                 }
+                #[cfg(feature = "shared-memory")]
                 ext::Shm::ID => {
                     let (s, ext): (ext::Shm, bool) = eodec.read(&mut *reader)?;
                     ext_shm = Some(s);
@@ -350,6 +391,11 @@ where
                     ext_compression = Some(q);
                     has_ext = ext;
                 }
+                ext::RemoteBound::ID => {
+                    let (q, ext): (ext::RemoteBound, bool) = eodec.read(&mut *reader)?;
+                    ext_south = Some(q);
+                    has_ext = ext;
+                }
                 _ => {
                     has_ext = extension::skip(reader, "OpenAck", ext)?;
                 }
@@ -360,11 +406,13 @@ where
             lease,
             initial_sn,
             ext_qos,
+            #[cfg(feature = "shared-memory")]
             ext_shm,
             ext_auth,
             ext_mlink,
             ext_lowlatency,
             ext_compression,
+            ext_south,
         })
     }
 }

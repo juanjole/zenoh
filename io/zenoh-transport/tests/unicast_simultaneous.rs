@@ -13,22 +13,21 @@
 //
 #[cfg(target_family = "unix")]
 mod tests {
-    use async_std::prelude::FutureExt;
-    use async_std::task;
-    use std::any::Any;
-    use std::convert::TryFrom;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use std::time::Duration;
-    use zenoh_core::zasync_executor_init;
+    use std::{
+        any::Any,
+        convert::TryFrom,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+
+    use zenoh_core::ztimeout;
     use zenoh_link::Link;
     use zenoh_protocol::{
-        core::{CongestionControl, Encoding, EndPoint, Priority, WhatAmI, ZenohId},
-        network::{
-            push::ext::{NodeIdType, QoSType},
-            NetworkMessage, Push,
-        },
-        zenoh::Put,
+        core::{CongestionControl, EndPoint, Priority, WhatAmI, ZenohIdProto},
+        network::{push::ext::QoSType, NetworkMessage, NetworkMessageMut, Push},
     };
     use zenoh_result::ZResult;
     use zenoh_transport::{
@@ -42,20 +41,14 @@ mod tests {
     const MSG_COUNT: usize = 16;
     const MSG_SIZE: usize = 1_024;
 
-    macro_rules! ztimeout {
-        ($f:expr) => {
-            $f.timeout(TIMEOUT).await.unwrap()
-        };
-    }
-
     // Transport Handler for the router
     struct SHPeer {
-        zid: ZenohId,
+        zid: ZenohIdProto,
         count: Arc<AtomicUsize>,
     }
 
     impl SHPeer {
-        fn new(zid: ZenohId) -> Self {
+        fn new(zid: ZenohIdProto) -> Self {
             Self {
                 zid,
                 count: Arc::new(AtomicUsize::new(0)),
@@ -74,28 +67,15 @@ mod tests {
             transport: TransportUnicast,
         ) -> ZResult<Arc<dyn TransportPeerEventHandler>> {
             // Create the message to send
-            let message: NetworkMessage = Push {
+            let message = NetworkMessage::from(Push {
                 wire_expr: "test".into(),
                 ext_qos: QoSType::new(Priority::Control, CongestionControl::Block, false),
-                ext_tstamp: None,
-                ext_nodeid: NodeIdType::default(),
-                payload: Put {
-                    payload: vec![0u8; MSG_SIZE].into(),
-                    timestamp: None,
-                    encoding: Encoding::default(),
-                    ext_sinfo: None,
-                    #[cfg(feature = "shared-memory")]
-                    ext_shm: None,
-                    ext_attachment: None,
-                    ext_unknown: vec![],
-                }
-                .into(),
-            }
-            .into();
+                ..Push::from(vec![0u8; MSG_SIZE])
+            });
 
             println!("[Simultaneous {}] Sending {}...", self.zid, MSG_COUNT);
             for _ in 0..MSG_COUNT {
-                transport.schedule(message.clone()).unwrap();
+                transport.schedule(message.clone().as_mut()).unwrap();
             }
             println!("[Simultaneous {}] ... sent {}", self.zid, MSG_COUNT);
 
@@ -122,14 +102,13 @@ mod tests {
     }
 
     impl TransportPeerEventHandler for MHPeer {
-        fn handle_message(&self, _msg: NetworkMessage) -> ZResult<()> {
+        fn handle_message(&self, _msg: NetworkMessageMut) -> ZResult<()> {
             self.count.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
 
         fn new_link(&self, _link: Link) {}
         fn del_link(&self, _link: Link) {}
-        fn closing(&self) {}
         fn closed(&self) {}
 
         fn as_any(&self) -> &dyn Any {
@@ -139,8 +118,8 @@ mod tests {
 
     async fn transport_simultaneous(endpoint01: Vec<EndPoint>, endpoint02: Vec<EndPoint>) {
         /* [Peers] */
-        let peer_id01 = ZenohId::try_from([2]).unwrap();
-        let peer_id02 = ZenohId::try_from([3]).unwrap();
+        let peer_id01 = ZenohIdProto::try_from([2]).unwrap();
+        let peer_id02 = ZenohIdProto::try_from([3]).unwrap();
 
         // Create the peer01 transport manager
         let peer_sh01 = Arc::new(SHPeer::new(peer_id01));
@@ -149,7 +128,7 @@ mod tests {
             .whatami(WhatAmI::Peer)
             .zid(peer_id01)
             .unicast(unicast)
-            .build(peer_sh01.clone())
+            .build_test(peer_sh01.clone())
             .unwrap();
 
         // Create the peer02 transport manager
@@ -159,7 +138,7 @@ mod tests {
             .whatami(WhatAmI::Peer)
             .zid(peer_id02)
             .unicast(unicast)
-            .build(peer_sh02.clone())
+            .build_test(peer_sh02.clone())
             .unwrap();
 
         // Add the endpoints on the peer01
@@ -168,7 +147,7 @@ mod tests {
             println!("[Simultaneous 01a] => Adding endpoint {e:?}: {res:?}");
             assert!(res.is_ok());
         }
-        let locs = peer01_manager.get_listeners();
+        let locs = ztimeout!(peer01_manager.get_listeners());
         println!("[Simultaneous 01b] => Getting endpoints: {endpoint01:?} {locs:?}");
         assert_eq!(endpoint01.len(), locs.len());
 
@@ -178,7 +157,7 @@ mod tests {
             println!("[Simultaneous 02a] => Adding endpoint {e:?}: {res:?}");
             assert!(res.is_ok());
         }
-        let locs = peer02_manager.get_listeners();
+        let locs = ztimeout!(peer02_manager.get_listeners());
         println!("[Simultaneous 02b] => Getting endpoints: {endpoint02:?} {locs:?}");
         assert_eq!(endpoint02.len(), locs.len());
 
@@ -188,7 +167,7 @@ mod tests {
 
         // Peer01
         let c_p01m = peer01_manager.clone();
-        let peer01_task = task::spawn(async move {
+        let peer01_task = tokio::task::spawn(async move {
             // Open the transport with the second peer
             // These open should succeed
             for e in c_ep02.iter() {
@@ -203,12 +182,12 @@ mod tests {
                 assert!(res.is_err());
             }
 
-            task::sleep(SLEEP).await;
+            tokio::time::sleep(SLEEP).await;
 
             let tp02 = ztimeout!(async {
                 let mut tp02 = None;
                 while tp02.is_none() {
-                    task::sleep(SLEEP).await;
+                    tokio::time::sleep(SLEEP).await;
                     println!(
                         "[Simultaneous 01e] => Transports: {:?}",
                         peer01_manager.get_transports_unicast().await
@@ -224,7 +203,7 @@ mod tests {
                 let expected = endpoint01.len() + c_ep02.len();
                 let mut tl02 = vec![];
                 while tl02.len() != expected {
-                    task::sleep(SLEEP).await;
+                    tokio::time::sleep(SLEEP).await;
                     tl02 = tp02.get_links().unwrap();
                     println!("[Simultaneous 01f] => Links {}/{}", tl02.len(), expected);
                 }
@@ -234,7 +213,7 @@ mod tests {
             ztimeout!(async {
                 let mut check = 0;
                 while check != MSG_COUNT {
-                    task::sleep(SLEEP).await;
+                    tokio::time::sleep(SLEEP).await;
                     check = peer_sh01.get_count();
                     println!("[Simultaneous 01g] => Received {check:?}/{MSG_COUNT:?}");
                 }
@@ -243,7 +222,7 @@ mod tests {
 
         // Peer02
         let c_p02m = peer02_manager.clone();
-        let peer02_task = task::spawn(async move {
+        let peer02_task = tokio::task::spawn(async move {
             // Open the transport with the first peer
             // These open should succeed
             for e in c_ep01.iter() {
@@ -259,12 +238,12 @@ mod tests {
             }
 
             // Wait a little bit
-            task::sleep(SLEEP).await;
+            tokio::time::sleep(SLEEP).await;
 
             let tp01 = ztimeout!(async {
                 let mut tp01 = None;
                 while tp01.is_none() {
-                    task::sleep(SLEEP).await;
+                    tokio::time::sleep(SLEEP).await;
                     println!(
                         "[Simultaneous 02e] => Transports: {:?}",
                         peer02_manager.get_transports_unicast().await
@@ -279,7 +258,7 @@ mod tests {
                 let expected = c_ep01.len() + endpoint02.len();
                 let mut tl01 = vec![];
                 while tl01.len() != expected {
-                    task::sleep(SLEEP).await;
+                    tokio::time::sleep(SLEEP).await;
                     tl01 = tp01.get_links().unwrap();
                     println!("[Simultaneous 02f] => Links {}/{}", tl01.len(), expected);
                 }
@@ -289,7 +268,7 @@ mod tests {
             ztimeout!(async {
                 let mut check = 0;
                 while check != MSG_COUNT {
-                    task::sleep(SLEEP).await;
+                    tokio::time::sleep(SLEEP).await;
                     check = peer_sh02.get_count();
                     println!("[Simultaneous 02g] => Received {check:?}/{MSG_COUNT:?}");
                 }
@@ -297,21 +276,17 @@ mod tests {
         });
 
         println!("[Simultaneous] => Waiting for peer01 and peer02 tasks...");
-        peer01_task.join(peer02_task).await;
+        let _ = tokio::join!(peer01_task, peer02_task);
         println!("[Simultaneous] => Waiting for peer01 and peer02 tasks... DONE\n");
 
         // Wait a little bit
-        task::sleep(SLEEP).await;
+        tokio::time::sleep(SLEEP).await;
     }
 
     #[cfg(feature = "transport_tcp")]
-    #[test]
-    fn transport_tcp_simultaneous() {
-        let _ = env_logger::try_init();
-        task::block_on(async {
-            zasync_executor_init!();
-        });
-
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn transport_tcp_simultaneous() {
+        zenoh_util::init_log_from_env_or("error");
         let endpoint01: Vec<EndPoint> = vec![
             format!("tcp/127.0.0.1:{}", 15000).parse().unwrap(),
             format!("tcp/127.0.0.1:{}", 15001).parse().unwrap(),
@@ -325,20 +300,14 @@ mod tests {
             format!("tcp/127.0.0.1:{}", 15013).parse().unwrap(),
         ];
 
-        task::block_on(async {
-            transport_simultaneous(endpoint01, endpoint02).await;
-        });
+        transport_simultaneous(endpoint01, endpoint02).await;
     }
 
     #[cfg(feature = "transport_unixpipe")]
-    #[test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore]
-    fn transport_unixpipe_simultaneous() {
-        let _ = env_logger::try_init();
-        task::block_on(async {
-            zasync_executor_init!();
-        });
-
+    async fn transport_unixpipe_simultaneous() {
+        zenoh_util::init_log_from_env_or("error");
         let endpoint01: Vec<EndPoint> = vec![
             "unixpipe/transport_unixpipe_simultaneous".parse().unwrap(),
             "unixpipe/transport_unixpipe_simultaneous2".parse().unwrap(),
@@ -352,19 +321,14 @@ mod tests {
             "unixpipe/transport_unixpipe_simultaneous8".parse().unwrap(),
         ];
 
-        task::block_on(async {
-            transport_simultaneous(endpoint01, endpoint02).await;
-        });
+        transport_simultaneous(endpoint01, endpoint02).await;
     }
 
     #[cfg(feature = "transport_ws")]
-    #[test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore]
-    fn transport_ws_simultaneous() {
-        let _ = env_logger::try_init();
-        task::block_on(async {
-            zasync_executor_init!();
-        });
+    async fn transport_ws_simultaneous() {
+        zenoh_util::init_log_from_env_or("error");
 
         let endpoint01: Vec<EndPoint> = vec![
             format!("ws/127.0.0.1:{}", 15020).parse().unwrap(),
@@ -379,8 +343,6 @@ mod tests {
             format!("ws/127.0.0.1:{}", 15033).parse().unwrap(),
         ];
 
-        task::block_on(async {
-            transport_simultaneous(endpoint01, endpoint02).await;
-        });
+        transport_simultaneous(endpoint01, endpoint02).await;
     }
 }

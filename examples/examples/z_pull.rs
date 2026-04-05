@@ -11,76 +11,103 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use async_std::prelude::FutureExt;
-use async_std::task::sleep;
-use clap::Parser;
-use futures::prelude::*;
 use std::time::Duration;
-use zenoh::config::Config;
-use zenoh::prelude::r#async::*;
+
+use clap::Parser;
+use zenoh::{handlers::RingChannel, key_expr::KeyExpr, Config};
 use zenoh_examples::CommonArgs;
 
-#[async_std::main]
+#[tokio::main]
 async fn main() {
     // initiate logging
-    env_logger::init();
+    zenoh::init_log_from_env_or("error");
 
-    let (config, key_expr) = parse_args();
+    let (config, key_expr, size, interval) = parse_args();
 
     println!("Opening session...");
-    let session = zenoh::open(config).res().await.unwrap();
+    let session = zenoh::open(config).await.unwrap();
 
     println!("Declaring Subscriber on '{key_expr}'...");
-
     let subscriber = session
         .declare_subscriber(&key_expr)
-        .pull_mode()
-        .res()
+        .with(RingChannel::new(size))
         .await
         .unwrap();
 
-    println!("Press <enter> to pull data...");
+    println!("Press CTRL-C to quit...");
 
-    // Define the future to handle incoming samples of the subscription.
-    let subs = async {
-        while let Ok(sample) = subscriber.recv_async().await {
-            println!(
-                ">> [Subscriber] Received {} ('{}': '{}')",
-                sample.kind,
-                sample.key_expr.as_str(),
-                sample.value,
-            );
-        }
-    };
-
-    // Define the future to handle keyboard's input.
-    let keyb = async {
-        let mut stdin = async_std::io::stdin();
-        let mut input = [0_u8];
-        loop {
-            stdin.read_exact(&mut input).await.unwrap();
-            match input[0] {
-                b'q' => break,
-                0 => sleep(Duration::from_secs(1)).await,
-                _ => subscriber.pull().res().await.unwrap(),
+    // Blocking recv. If the ring is empty, wait for the first sample to arrive.
+    loop {
+        // Use .recv() for the synchronous version.
+        match subscriber.recv_async().await {
+            Ok(sample) => {
+                let payload = sample
+                    .payload()
+                    .try_to_string()
+                    .unwrap_or_else(|e| e.to_string().into());
+                println!(
+                    ">> [Subscriber] Pulled {} ('{}': '{}')... performing a computation of {:#?}",
+                    sample.kind(),
+                    sample.key_expr().as_str(),
+                    payload,
+                    interval
+                );
+                tokio::time::sleep(interval).await;
+            }
+            Err(e) => {
+                println!(">> [Subscriber] Pull error: {e}");
+                return;
             }
         }
-    };
+    }
 
-    // Execute both futures concurrently until one of them returns.
-    subs.race(keyb).await;
+    // Non-blocking recv. This can be usually used to implement a polling mechanism.
+    // loop {
+    //     match subscriber.try_recv() {
+    //         Ok(Some(sample)) => {
+    //             let payload = sample
+    //                 .payload()
+    //                 .try_to_string()
+    //                 .unwrap_or_else(|e| e.to_string().into());
+    //             println!(
+    //                 ">> [Subscriber] Pulled {} ('{}': '{}')",
+    //                 sample.kind(),
+    //                 sample.key_expr().as_str(),
+    //                 payload,
+    //             );
+    //         }
+    //         Ok(None) => {
+    //             println!(
+    //                 ">> [Subscriber] Pulled nothing... sleep for {:#?}",
+    //                 interval
+    //             );
+    //             tokio::time::sleep(interval).await;
+    //         }
+    //         Err(e) => {
+    //             println!(">> [Subscriber] Pull error: {e}");
+    //             return;
+    //         }
+    //     }
+    // }
 }
 
-#[derive(clap::Parser, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(clap::Parser, Clone, PartialEq, Debug)]
 struct SubArgs {
     #[arg(short, long, default_value = "demo/example/**")]
     /// The Key Expression to subscribe to.
     key: KeyExpr<'static>,
+    /// The size of the ringbuffer.
+    #[arg(short, long, default_value = "3")]
+    size: usize,
+    /// The interval for pulling the ringbuffer.
+    #[arg(short, long, default_value = "5.0")]
+    interval: f32,
     #[command(flatten)]
     common: CommonArgs,
 }
 
-fn parse_args() -> (Config, KeyExpr<'static>) {
+fn parse_args() -> (Config, KeyExpr<'static>, usize, Duration) {
     let args = SubArgs::parse();
-    (args.common.into(), args.key)
+    let interval = Duration::from_secs_f32(args.interval);
+    (args.common.into(), args.key, args.size, interval)
 }

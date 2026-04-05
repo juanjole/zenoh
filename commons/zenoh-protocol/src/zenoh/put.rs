@@ -11,10 +11,12 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::{common::ZExtUnknown, core::Encoding};
 use alloc::vec::Vec;
+
 use uhlc::Timestamp;
 use zenoh_buffers::ZBuf;
+
+use crate::{common::ZExtUnknown, core::Encoding};
 
 /// # Put message
 ///
@@ -43,7 +45,7 @@ pub mod flag {
     pub const Z: u8 = 1 << 7; // 0x80 Extensions    if Z==1 then an extension will follow
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Put {
     pub timestamp: Option<Timestamp>,
     pub encoding: Encoding,
@@ -57,8 +59,8 @@ pub struct Put {
 
 pub mod ext {
     #[cfg(feature = "shared-memory")]
-    use crate::{common::ZExtUnit, zextunit};
-    use crate::{common::ZExtZBuf, zextzbuf};
+    use crate::zextunit;
+    use crate::zextzbuf;
 
     /// # SourceInfo extension
     /// Used to carry additional information about the source of data
@@ -66,7 +68,7 @@ pub mod ext {
     pub type SourceInfoType = crate::zenoh::ext::SourceInfoType<{ SourceInfo::ID }>;
 
     /// # Shared Memory extension
-    /// Used to carry additional information about the shared-memory layour of data
+    /// Used to carry additional information about the shared-memory layout of data
     #[cfg(feature = "shared-memory")]
     pub type Shm = zextunit!(0x2, true);
     #[cfg(feature = "shared-memory")]
@@ -79,14 +81,16 @@ pub mod ext {
 
 impl Put {
     #[cfg(feature = "test")]
+    #[doc(hidden)]
     pub fn rand() -> Self {
-        use crate::{common::iext, core::ZenohId};
         use rand::Rng;
+
+        use crate::{common::iext, core::ZenohIdProto};
         let mut rng = rand::thread_rng();
 
         let timestamp = rng.gen_bool(0.5).then_some({
             let time = uhlc::NTP64(rng.gen());
-            let id = uhlc::ID::try_from(ZenohId::rand().to_le_bytes()).unwrap();
+            let id = uhlc::ID::try_from(ZenohIdProto::rand().to_le_bytes()).unwrap();
             Timestamp::new(time, id)
         });
         let encoding = Encoding::rand();

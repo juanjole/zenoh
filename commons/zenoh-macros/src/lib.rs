@@ -16,12 +16,19 @@
 //!
 //! This crate is intended for Zenoh's internal use.
 //!
-//! [Click here for Zenoh's documentation](../zenoh/index.html)
+//! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
 use proc_macro::TokenStream;
-use quote::quote;
-use zenoh_keyexpr::format::{
-    macro_support::{self, SegmentBuilder},
-    KeFormat,
+use quote::{quote, ToTokens};
+use syn::{
+    parse_macro_input, parse_quote, spanned::Spanned, Attribute, Error, Item, ItemImpl, LitStr,
+    TraitItem,
+};
+use zenoh_keyexpr::{
+    format::{
+        macro_support::{self, SegmentBuilder},
+        KeFormat,
+    },
+    key_expr::keyexpr,
 };
 
 const RUSTC_VERSION: &str = include_str!(concat!(env!("OUT_DIR"), "/version.rs"));
@@ -55,19 +62,205 @@ pub fn rustc_version_release(_tokens: TokenStream) -> TokenStream {
     (quote! {(#release, #commit)}).into()
 }
 
+/// An enumeration of items which can be annotated with `#[zenoh_macros::unstable_doc]`, #[zenoh_macros::unstable]`, `#[zenoh_macros::internal]`
+#[allow(clippy::large_enum_variant)]
+enum AnnotableItem {
+    /// Wrapper around [`syn::Item`].
+    Item(Item),
+    /// Wrapper around [`syn::TraitItem`].
+    TraitItem(TraitItem),
+}
+
+macro_rules! parse_annotable_item {
+    ($tokens:ident) => {{
+        let item: Item = parse_macro_input!($tokens as Item);
+
+        if matches!(item, Item::Verbatim(_)) {
+            let tokens = TokenStream::from(item.to_token_stream());
+            let trait_item: TraitItem = parse_macro_input!(tokens as TraitItem);
+
+            if matches!(trait_item, TraitItem::Verbatim(_)) {
+                Err(Error::new_spanned(
+                    trait_item,
+                    "the `unstable` proc-macro attribute only supports items and trait items",
+                ))
+            } else {
+                Ok(AnnotableItem::TraitItem(trait_item))
+            }
+        } else {
+            Ok(AnnotableItem::Item(item))
+        }
+    }};
+}
+
+impl AnnotableItem {
+    /// Mutably borrows the attribute list of this item.
+    fn attributes_mut(&mut self) -> Result<&mut Vec<Attribute>, Error> {
+        match self {
+            AnnotableItem::Item(item) => match item {
+                Item::Const(item) => Ok(&mut item.attrs),
+                Item::Enum(item) => Ok(&mut item.attrs),
+                Item::ExternCrate(item) => Ok(&mut item.attrs),
+                Item::Fn(item) => Ok(&mut item.attrs),
+                Item::ForeignMod(item) => Ok(&mut item.attrs),
+                Item::Impl(item) => Ok(&mut item.attrs),
+                Item::Macro(item) => Ok(&mut item.attrs),
+                Item::Mod(item) => Ok(&mut item.attrs),
+                Item::Static(item) => Ok(&mut item.attrs),
+                Item::Struct(item) => Ok(&mut item.attrs),
+                Item::Trait(item) => Ok(&mut item.attrs),
+                Item::TraitAlias(item) => Ok(&mut item.attrs),
+                Item::Type(item) => Ok(&mut item.attrs),
+                Item::Union(item) => Ok(&mut item.attrs),
+                Item::Use(item) => Ok(&mut item.attrs),
+                other => Err(Error::new_spanned(
+                    other,
+                    "item is not supported by the `unstable` or `internal` proc-macro attribute",
+                )),
+            },
+            AnnotableItem::TraitItem(trait_item) => match trait_item {
+                TraitItem::Const(trait_item) => Ok(&mut trait_item.attrs),
+                TraitItem::Fn(trait_item) => Ok(&mut trait_item.attrs),
+                TraitItem::Type(trait_item) => Ok(&mut trait_item.attrs),
+                TraitItem::Macro(trait_item) => Ok(&mut trait_item.attrs),
+                other => Err(Error::new_spanned(
+                    other,
+                    "item is not supported by the `unstable` or `internal` proc-macro attribute",
+                )),
+            },
+        }
+    }
+
+    /// Converts this item to a `proc_macro2::TokenStream`.
+    fn to_token_stream(&self) -> proc_macro2::TokenStream {
+        match self {
+            AnnotableItem::Item(item) => item.to_token_stream(),
+            AnnotableItem::TraitItem(trait_item) => trait_item.to_token_stream(),
+        }
+    }
+}
+
+/// Adds unstable warning to documentation. Returns Result for proper error handling.
+fn add_unstable_warning(item: &mut AnnotableItem) -> Result<(), Error> {
+    let attrs = item.attributes_mut()?;
+
+    let mut old_attrs = std::mem::take(attrs).into_iter();
+
+    // First loop: copy attrs until first doc attr, add warning after it
+    for attr in old_attrs.by_ref() {
+        attrs.push(attr);
+        if get_doc_str(attrs.last().unwrap()).is_some() {
+            // See: https://doc.rust-lang.org/rustdoc/how-to-write-documentation.html#adding-a-warning-block
+            let message = "<div class=\"warning\">This API has been marked as <strong>unstable</strong>: it works as advertised, but it may be changed in a future release.</div>";
+            let note: Attribute = parse_quote!(#[doc = #message]);
+            attrs.push(note);
+            break;
+        }
+    }
+
+    // Second loop: copy attrs until second doc attr, validate that it's blank
+    for attr in old_attrs.by_ref() {
+        if let Some(lit_str) = get_doc_str(&attr) {
+            if !lit_str.value().trim().is_empty() {
+                return Err(Error::new_spanned(
+                    attr,
+                    "documentation for `#[unstable]` items must have a blank doc line after the brief description. \
+                     This blank line is critical for proper formatting: it will separate the unstable warning from the content below and ensures that \
+                     markdown links (like [`Type`](path::to::Type)) are correctly processed by rustdoc. \
+                     Add an empty `///` line after your brief description and before detailed explanations.",
+                ));
+            }
+            attrs.push(attr);
+            break;
+        }
+        attrs.push(attr);
+    }
+
+    // Third loop: copy remaining attrs
+    attrs.extend(old_attrs);
+
+    Ok(())
+}
+
 #[proc_macro_attribute]
-pub fn unstable(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let item = proc_macro2::TokenStream::from(item);
-    TokenStream::from(quote! {
-        #[cfg(feature = "unstable")]
-        /// <div class="stab unstable">
-        ///   <span class="emoji">🔬</span>
-        ///   This API has been marked as unstable: it works as advertised, but we may change it in a future release.
-        ///   To use it, you must enable zenoh's <code>unstable</code> feature flag.
-        /// </div>
-        ///
-        #item
-    })
+/// Adds only piece of documentation about the item being unstable but no unstable attribute itself.
+/// This is useful when the whole crate is supposed to be used in unstable mode only, it makes sense
+/// to mention it in documentation for the crate items, but not to add `#[cfg(feature = "unstable")]` to every item.
+pub fn unstable_doc(_attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    let mut item = match parse_annotable_item!(tokens) {
+        Ok(item) => item,
+        Err(err) => return err.into_compile_error().into(),
+    };
+
+    if let Err(err) = add_unstable_warning(&mut item) {
+        return err.into_compile_error().into();
+    }
+
+    TokenStream::from(item.to_token_stream())
+}
+
+#[proc_macro_attribute]
+/// Adds a `#[cfg(feature = "unstable")]` attribute to the item and appends piece of documentation about the item being unstable.
+pub fn unstable(_attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    let mut item = match parse_annotable_item!(tokens) {
+        Ok(item) => item,
+        Err(err) => return err.into_compile_error().into(),
+    };
+
+    if let Err(err) = add_unstable_warning(&mut item) {
+        return err.into_compile_error().into();
+    }
+
+    let attrs = match item.attributes_mut() {
+        Ok(attrs) => attrs,
+        Err(err) => return err.into_compile_error().into(),
+    };
+
+    let feature_gate: Attribute = parse_quote!(#[cfg(feature = "unstable")]);
+    attrs.push(feature_gate);
+
+    TokenStream::from(item.to_token_stream())
+}
+
+#[proc_macro_attribute]
+/// Adds a `#[cfg(feature = "internal")]` and `#[doc(hidden)]` attributes to the item.
+pub fn internal(_attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    let mut item = match parse_annotable_item!(tokens) {
+        Ok(item) => item,
+        Err(err) => return err.into_compile_error().into(),
+    };
+
+    let attrs = match item.attributes_mut() {
+        Ok(attrs) => attrs,
+        Err(err) => return err.into_compile_error().into(),
+    };
+
+    let feature_gate: Attribute = parse_quote!(#[cfg(feature = "internal")]);
+    let hide_doc: Attribute = parse_quote!(#[doc(hidden)]);
+    attrs.push(feature_gate);
+    attrs.push(hide_doc);
+
+    TokenStream::from(item.to_token_stream())
+}
+
+/// Extracts the string literal from a `#[doc = "..."]` attribute.
+fn get_doc_str(attr: &Attribute) -> Option<&LitStr> {
+    if attr
+        .path()
+        .get_ident()
+        .is_some_and(|ident| &ident.to_string() == "doc")
+    {
+        if let syn::Meta::NameValue(nv) = &attr.meta {
+            if let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(lit_str),
+                ..
+            }) = &nv.value
+            {
+                return Some(lit_str);
+            }
+        }
+    }
+    None
 }
 
 fn keformat_support(source: &str) -> proc_macro2::TokenStream {
@@ -90,11 +283,34 @@ fn keformat_support(source: &str) -> proc_macro2::TokenStream {
         }
     });
     let getters = specs.iter().map(|spec| {
-        let id = &source[spec.spec_start..(spec.spec_start + spec.id_end as usize)];
+        let source = &source[spec.spec_start..spec.spec_end];
+        let id = &source[..(spec.id_end as usize)];
         let get_id = quote::format_ident!("{}", id);
-        quote! {
-            pub fn #get_id (&self) -> Option<& ::zenoh::key_expr::keyexpr> {
-                unsafe {self._0.get(#id).unwrap_unchecked()}
+        let pattern = unsafe {
+            keyexpr::from_str_unchecked(if spec.pattern_end != u16::MAX {
+                &source[(spec.id_end as usize + 1)..(spec.spec_start + spec.pattern_end as usize)]
+            } else {
+                &source[(spec.id_end as usize + 1)..]
+            })
+        };
+        let doc = format!("Get the parsed value for `{id}`.\n\nThis value is guaranteed to be a valid key expression intersecting with `{pattern}`");
+        if pattern.as_bytes() == b"**" {
+            quote! {
+                #[doc = #doc]
+                /// Since the pattern is `**`, this may return `None` if the pattern didn't consume any chunks.
+                pub fn #get_id (&self) -> Option<& ::zenoh::key_expr::keyexpr> {
+                    unsafe {
+                        let s =self._0.get(#id).unwrap_unchecked();
+                        (!s.is_empty()).then(|| ::zenoh::key_expr::keyexpr::from_str_unchecked(s))
+                    }
+                }
+            }
+        } else {
+            quote! {
+                #[doc = #doc]
+                pub fn #get_id (&self) -> &::zenoh::key_expr::keyexpr {
+                    unsafe {::zenoh::key_expr::keyexpr::from_str_unchecked(self._0.get(#id).unwrap_unchecked())}
+                }
             }
         }
     });
@@ -225,7 +441,7 @@ impl syn::parse::Parse for FormatDeclarations {
 /// - `formatter()`, a function that constructs a `Formatter` specialized for your format:
 ///     - for every spec in your format, `Formatter` will have a method named after the spec's `id` that lets you set a value for that field of your format. These methods will return `Result<&mut Formatter, FormatError>`.
 /// - `parse(target: &keyexpr) -> ZResult<Parsed<'_>>` will parse the provided key expression according to your format. Just like `KeFormat::parse`, parsing is lazy: each field will match the smallest subsection of your `target` that is included in its pattern.
-///     - like `Formatter`, `Parsed` will have a method named after each spec's `id` that returns `Option<&keyexpr>`. That `Option` will only be `None` if the spec's format was `**` and matched a sequence of 0 chunks.
+///     - like `Formatter`, `Parsed` will have a method named after each spec's `id` that returns `&keyexpr`; except for specs whose pattern was `**`, these will return an `Option<&keyexpr>`, where `None` signifies that the pattern was matched by an empty list of chunks.
 #[proc_macro]
 pub fn kedefine(tokens: TokenStream) -> TokenStream {
     let declarations: FormatDeclarations = syn::parse(tokens).unwrap();
@@ -238,7 +454,7 @@ pub fn kedefine(tokens: TokenStream) -> TokenStream {
 - `formatter()`, a function that constructs a `Formatter` specialized for your format:
     - for every spec in your format, `Formatter` will have a method named after the spec's `id` that lets you set a value for that field of your format. These methods will return `Result<&mut Formatter, FormatError>`.
 - `parse(target: &keyexpr) -> ZResult<Parsed<'_>>` will parse the provided key expression according to your format. Just like `KeFormat::parse`, parsing is lazy: each field will match the smallest subsection of your `target` that is included in its pattern.
-    - like `Formatter`, `Parsed` will have a method named after each spec's `id` that returns `Option<&keyexpr>`. That `Option` will only be `None` if the spec's format was `**` and matched a sequence of 0 chunks."
+    - like `Formatter`, `Parsed` will have a method named after each spec's `id` that returns `&keyexpr`; except for specs whose pattern was `**`, these will return an `Option<&keyexpr>`, where `None` signifies that the pattern was matched by an empty list of chunks."
     );
     let support = keformat_support(&source);
     quote! {
@@ -277,9 +493,9 @@ impl syn::parse::Parse for FormatUsage {
 /// Write a set of values into a `Formatter`, stopping as soon as a value doesn't fit the specification for its field.
 /// Contrary to `keformat` doesn't build the Formatter into a Key Expression.
 ///
-/// `kewrite!($formatter, $($ident [= $expr]),*)` will attempt to write `$expr` into their respective `$ident` fields for `$formatter`.  
-/// `$formatter` must be an expression that dereferences to `&mut Formatter`.  
-/// `$expr` must resolve to a value that implements `core::fmt::Display`.  
+/// `kewrite!($formatter, $($ident [= $expr]),*)` will attempt to write `$expr` into their respective `$ident` fields for `$formatter`.
+/// `$formatter` must be an expression that dereferences to `&mut Formatter`.
+/// `$expr` must resolve to a value that implements `core::fmt::Display`.
 /// `$expr` defaults to `$ident` if omitted.
 ///
 /// This macro always results in an expression that resolves to `Result<&mut Formatter, FormatSetError>`.
@@ -299,9 +515,9 @@ pub fn kewrite(tokens: TokenStream) -> TokenStream {
 
 /// Write a set of values into a `Formatter` and then builds it into an `OwnedKeyExpr`, stopping as soon as a value doesn't fit the specification for its field.
 ///
-/// `keformat!($formatter, $($ident [= $expr]),*)` will attempt to write `$expr` into their respective `$ident` fields for `$formatter`.  
-/// `$formatter` must be an expression that dereferences to `&mut Formatter`.  
-/// `$expr` must resolve to a value that implements `core::fmt::Display`.  
+/// `keformat!($formatter, $($ident [= $expr]),*)` will attempt to write `$expr` into their respective `$ident` fields for `$formatter`.
+/// `$formatter` must be an expression that dereferences to `&mut Formatter`.
+/// `$expr` must resolve to a value that implements `core::fmt::Display`.
 /// `$expr` defaults to `$ident` if omitted.
 ///
 /// This macro always results in an expression that resolves to `ZResult<OwnedKeyExpr>`, and leaves `$formatter` in its written state.
@@ -313,4 +529,238 @@ pub fn keformat(tokens: TokenStream) -> TokenStream {
         Err(e) => Err(e.into()),
     })
     .into()
+}
+
+/// Equivalent to [`keyexpr::new`](zenoh_keyexpr::keyexpr::new), but the check is run at compile-time and will throw a compile error in case of failure.
+#[proc_macro]
+pub fn ke(tokens: TokenStream) -> TokenStream {
+    let value: LitStr = syn::parse(tokens).unwrap();
+    let ke = value.value();
+    match zenoh_keyexpr::keyexpr::new(&ke) {
+        Ok(_) => quote!(unsafe { zenoh::key_expr::keyexpr::from_str_unchecked(#ke)}).into(),
+        Err(e) => panic!("{}", e),
+    }
+}
+
+/// Equivalent to [`nonwild_keyexpr::new`](zenoh_keyexpr::nonwild_keyexpr::new), but the check is run at compile-time and will throw a compile error in case of failure.
+#[proc_macro]
+pub fn nonwild_ke(tokens: TokenStream) -> TokenStream {
+    let value: LitStr = syn::parse(tokens).unwrap();
+    let ke = value.value();
+    match zenoh_keyexpr::nonwild_keyexpr::new(&ke) {
+        Ok(_) => quote!(unsafe { zenoh::key_expr::nonwild_keyexpr::from_str_unchecked(#ke)}).into(),
+        Err(e) => panic!("{}", e),
+    }
+}
+
+mod zenoh_runtime_derive;
+use syn::DeriveInput;
+use zenoh_runtime_derive::{derive_generic_runtime_param, derive_register_param};
+
+/// Make the underlying struct `Param` be generic over any `T` satisfying a generated `trait DefaultParam { fn param() -> Param; }`
+/// ```rust,ignore
+/// #[derive(GenericRuntimeParam)]
+/// struct Param {
+///    ...
+/// }
+/// ```
+#[proc_macro_derive(GenericRuntimeParam)]
+pub fn generic_runtime_param(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input: DeriveInput = syn::parse_macro_input!(input);
+    derive_generic_runtime_param(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Register the input `Enum` with the struct `Param` specified in the param attribute
+/// ```rust,ignore
+/// #[derive(RegisterParam)]
+/// #[param(Param)]
+/// enum Enum {
+///    ...
+/// }
+/// ```
+#[proc_macro_derive(RegisterParam, attributes(alias, param))]
+pub fn register_param(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input: DeriveInput = syn::parse_macro_input!(input);
+    derive_register_param(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Macro `#[internal_trait]` should precede
+/// `impl Trait for Struct { ... }`
+///
+/// This macro wraps the implementations of "internal" tratis.
+///
+/// These traits are used to group set of functions which should be implemented
+/// together and with the same prototype. E.g. `QoSBuilderTrait` provides set of
+/// setters (`congestion_control`, `priority`, `express`) and we should not
+/// forget to implement all these setters for each entity which supports
+/// QoS functionality.
+///
+/// The traits mechanism is a good way to group functions. But additional traits
+/// adds extra burden to end user who have to import it every time.
+///
+/// The macro `internal_trait` solves this problem by adding
+/// methods with same names as in trait to structure implementation itself,
+/// making them available to user without additional trait import.
+///
+#[proc_macro_attribute]
+pub fn internal_trait(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut input = parse_macro_input!(item as ItemImpl);
+    let trait_path = &input.trait_.as_ref().unwrap().1;
+    let struct_path = &input.self_ty;
+    let generics = &input.generics;
+    // let struct_lifetime = get_type_path_lifetime(struct_path);
+
+    let mut struct_methods = quote! {};
+    for item_fn in input.items.iter_mut() {
+        if let syn::ImplItem::Fn(method) = item_fn {
+            let method_name = &method.sig.ident;
+            let method_generic_params = &method.sig.generics.params;
+            let method_generic_params = if method_generic_params.is_empty() {
+                quote! {}
+            } else {
+                quote! {<#method_generic_params>}
+            };
+            let method_args = &method.sig.inputs;
+            let method_output = &method.sig.output;
+            let where_clause = &method.sig.generics.where_clause;
+            let mut method_call_args = quote! {};
+            for arg in method_args.iter() {
+                match arg {
+                    syn::FnArg::Receiver(_) => {
+                        method_call_args.extend(quote! { self, });
+                    }
+                    syn::FnArg::Typed(pat_type) => {
+                        let pat = &pat_type.pat;
+                        method_call_args.extend(quote! { #pat, });
+                    }
+                }
+            }
+            let mut attributes = quote! {};
+            for attr in &method.attrs {
+                attributes.extend(quote! {
+                    #attr
+                });
+            }
+            method
+                .attrs
+                .retain(|attr| !attr.meta.path().is_ident("deprecated"));
+            // call corresponding trait method from struct method
+            struct_methods.extend(quote! {
+                #attributes
+                pub fn #method_name #method_generic_params (#method_args) #method_output #where_clause {
+                    <#struct_path as #trait_path>::#method_name(#method_call_args)
+                }
+            });
+        }
+    }
+    let struct_methods_output = quote! {
+        impl #generics #struct_path {
+            #struct_methods
+        }
+    };
+    (quote! {
+        #input
+        #struct_methods_output
+    })
+    .into()
+}
+
+#[proc_macro_attribute]
+pub fn pub_visibility_if_internal(_attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    let mut out = TokenStream::new();
+    let mut item_original: syn::Item = syn::parse(tokens).expect("failed to parse input");
+    let item_modified;
+    let not_internal_feature_gate: Attribute = parse_quote!(#[cfg(not(feature = "internal"))]);
+    let internal_feature_gate: Attribute = parse_quote!(#[cfg(feature = "internal")]);
+    let hide_doc: Attribute = parse_quote!(#[doc(hidden)]);
+    let allow_dead_code: Attribute = parse_quote!(#[allow(dead_code)]);
+    match &mut item_original {
+        Item::Fn(item_fn) => {
+            let mut item_fn_modified = item_fn.clone();
+            item_fn_modified.vis = syn::Visibility::Public(syn::token::Pub(item_fn.span()));
+            item_fn_modified
+                .attrs
+                .splice(0..0, vec![internal_feature_gate, hide_doc, allow_dead_code]);
+            item_modified = Item::Fn(item_fn_modified);
+            item_fn.attrs.splice(0..0, vec![not_internal_feature_gate]);
+        }
+        Item::Struct(item_struct) => {
+            let mut item_struct_modified = item_struct.clone();
+            item_struct_modified
+                .attrs
+                .splice(0..0, vec![internal_feature_gate, hide_doc, allow_dead_code]);
+            item_struct_modified.vis = syn::Visibility::Public(syn::token::Pub(item_struct.span()));
+            item_modified = Item::Struct(item_struct_modified);
+            item_struct
+                .attrs
+                .splice(0..0, vec![not_internal_feature_gate]);
+        }
+        Item::Type(item_type) => {
+            let mut item_type_modified = item_type.clone();
+            item_type_modified
+                .attrs
+                .splice(0..0, vec![internal_feature_gate, hide_doc, allow_dead_code]);
+            item_type_modified.vis = syn::Visibility::Public(syn::token::Pub(item_type.span()));
+            item_modified = Item::Type(item_type_modified);
+            item_type
+                .attrs
+                .splice(0..0, vec![not_internal_feature_gate]);
+        }
+        _ => panic!("pub_visibility_if_internal only works with struct, type and fn"),
+    }
+    let ts: TokenStream = item_original.into_token_stream().into();
+    out.extend(ts);
+    let ts: TokenStream = item_modified.into_token_stream().into();
+    out.extend(ts);
+    out
+}
+
+// applies zenoh_macros::internal if unstable feature is disabled, otherwise applies zenoh_macros::unstable
+#[proc_macro_attribute]
+pub fn internal_or_unstable(_attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    let mut out = TokenStream::new();
+    let mut item_original: syn::Item = syn::parse(tokens).expect("failed to parse input");
+    let item_modified;
+    let non_unstable_feature_gate: Attribute = parse_quote!(#[cfg(not(feature = "unstable"))]);
+    let internal_feature_gate: Attribute = parse_quote!(#[zenoh_macros::internal]);
+    let unstable_feature_gate: Attribute = parse_quote!(#[zenoh_macros::unstable]);
+    match &mut item_original {
+        Item::Fn(item_fn) => {
+            let mut item_fn_modified = item_fn.clone();
+            item_fn_modified.vis = syn::Visibility::Public(syn::token::Pub(item_fn.span()));
+            item_fn_modified
+                .attrs
+                .splice(0..0, vec![non_unstable_feature_gate, internal_feature_gate]);
+            item_modified = Item::Fn(item_fn_modified);
+            item_fn.attrs.splice(0..0, vec![unstable_feature_gate]);
+        }
+        Item::Struct(item_struct) => {
+            let mut item_struct_modified = item_struct.clone();
+            item_struct_modified
+                .attrs
+                .splice(0..0, vec![non_unstable_feature_gate, internal_feature_gate]);
+            item_struct_modified.vis = syn::Visibility::Public(syn::token::Pub(item_struct.span()));
+            item_modified = Item::Struct(item_struct_modified);
+            item_struct.attrs.splice(0..0, vec![unstable_feature_gate]);
+        }
+        Item::Type(item_type) => {
+            let mut item_type_modified = item_type.clone();
+            item_type_modified
+                .attrs
+                .splice(0..0, vec![non_unstable_feature_gate, internal_feature_gate]);
+            item_type_modified.vis = syn::Visibility::Public(syn::token::Pub(item_type.span()));
+            item_modified = Item::Type(item_type_modified);
+            item_type.attrs.splice(0..0, vec![unstable_feature_gate]);
+        }
+        _ => panic!("internal_or_unstable only works with struct, type and fn"),
+    }
+    let ts: TokenStream = item_original.into_token_stream().into();
+    out.extend(ts);
+    let ts: TokenStream = item_modified.into_token_stream().into();
+    out.extend(ts);
+    out
 }

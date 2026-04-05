@@ -11,8 +11,8 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::{RCodec, WCodec, Zenoh080, Zenoh080Bounded, Zenoh080Header};
 use alloc::vec::Vec;
+
 use zenoh_buffers::{
     reader::{DidntRead, Reader},
     writer::{DidntWrite, Writer},
@@ -22,6 +22,8 @@ use zenoh_protocol::common::{
     iext, imsg::has_flag, ZExtBody, ZExtUnit, ZExtUnknown, ZExtZ64, ZExtZBuf, ZExtZBufHeader,
 };
 
+use crate::{RCodec, WCodec, Zenoh080, Zenoh080Bounded, Zenoh080Header};
+
 fn read_inner<R>(reader: &mut R, _s: &str, header: u8) -> Result<(ZExtUnknown, bool), DidntRead>
 where
     R: Reader,
@@ -30,11 +32,11 @@ where
     let (u, has_ext): (ZExtUnknown, bool) = codec.read(&mut *reader)?;
     if u.is_mandatory() {
         #[cfg(feature = "std")]
-        log::error!("Unknown {_s} ext: {u:?}");
+        tracing::error!("Unknown {_s} ext: {u:?}");
         return Err(DidntRead);
     } else {
         #[cfg(feature = "std")]
-        log::debug!("Unknown {_s} ext: {u:?}");
+        tracing::debug!("Unknown {_s} ext: {u:?}");
     }
     Ok((u, has_ext))
 }

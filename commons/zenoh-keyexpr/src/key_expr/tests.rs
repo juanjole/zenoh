@@ -12,8 +12,9 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
-use crate::key_expr::{fuzzer, intersect::*, keyexpr};
 use std::{convert::TryInto, fmt::Debug};
+
+use crate::key_expr::{fuzzer, intersect::*, keyexpr};
 
 type BoxedIntersectors = Vec<Box<dyn for<'a> Intersector<&'a keyexpr, &'a keyexpr> + Send + Sync>>;
 
@@ -84,6 +85,31 @@ fn intersections() {
     assert!(intersect("x/a$*d$*e", "x/ade"));
     assert!(!intersect("x/c$*", "x/abc$*"));
     assert!(!intersect("x/$*d", "x/$*e"));
+
+    assert!(intersect("@a", "@a"));
+    assert!(!intersect("@a", "@ab"));
+    assert!(!intersect("@a", "@a/b"));
+    assert!(!intersect("@a", "@a/*"));
+    assert!(!intersect("@a", "@a/*/**"));
+    assert!(!intersect("@a", "@a$*/**"));
+    assert!(intersect("@a", "@a/**"));
+    assert!(!intersect("**/xyz$*xyz", "@a/b/xyzdefxyz"));
+    assert!(intersect("@a/**/c/**/e", "@a/b/b/b/c/d/d/d/e"));
+    assert!(!intersect("@a/**/c/**/e", "@a/@b/b/b/c/d/d/d/e"));
+    assert!(intersect("@a/**/@c/**/e", "@a/b/b/b/@c/d/d/d/e"));
+    assert!(intersect("@a/**/e", "@a/b/b/d/d/d/e"));
+    assert!(intersect("@a/**/e", "@a/b/b/b/d/d/d/e"));
+    assert!(intersect("@a/**/e", "@a/b/b/c/d/d/d/e"));
+    assert!(!intersect("@a/**/e", "@a/b/b/@c/b/d/d/d/e"));
+    assert!(!intersect("@a/*", "@a/@b"));
+    assert!(!intersect("@a/**", "@a/@b"));
+    assert!(intersect("@a/**/@b", "@a/@b"));
+    assert!(intersect("@a/@b/**", "@a/@b"));
+    assert!(intersect("@a/**/@c/**/@b", "@a/**/@c/@b"));
+    assert!(intersect("@a/**/@c/**/@b", "@a/@c/**/@b"));
+    assert!(intersect("@a/**/@c/@b", "@a/@c/**/@b"));
+    assert!(!intersect("@a/**/@b", "@a/**/@c/**/@b"));
+    assert!(intersect("@a", "**/@a"));
 }
 
 fn includes<
@@ -146,6 +172,21 @@ fn inclusions() {
     assert!(!includes("x/c$*", "x/abc$*"));
     assert!(includes("x/$*c$*", "x/abc$*"));
     assert!(!includes("x/$*d", "x/$*e"));
+
+    assert!(includes("@a", "@a"));
+    assert!(!includes("@a", "@ab"));
+    assert!(!includes("@a", "@a/b"));
+    assert!(!includes("@a", "@a/*"));
+    assert!(!includes("@a", "@a/*/**"));
+    assert!(!includes("@a$*/**", "@a"));
+    assert!(!includes("@a", "@a/**"));
+    assert!(includes("@a/**", "@a"));
+    assert!(!includes("**/xyz$*xyz", "@a/b/xyzdefxyz"));
+    assert!(includes("@a/**/c/**/e", "@a/b/b/b/c/d/d/d/e"));
+    assert!(!includes("@a/*", "@a/@b"));
+    assert!(!includes("@a/**", "@a/@b"));
+    assert!(includes("@a/**/@b", "@a/@b"));
+    assert!(includes("@a/@b/**", "@a/@b"));
 }
 
 #[test]

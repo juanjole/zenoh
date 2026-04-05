@@ -11,22 +11,24 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::{common::extension, LCodec, RCodec, WCodec, Zenoh080, Zenoh080Header, Zenoh080Length};
 use alloc::boxed::Box;
 use core::time::Duration;
+
 use zenoh_buffers::{
     reader::{DidntRead, Reader},
     writer::{DidntWrite, Writer},
 };
 use zenoh_protocol::{
     common::{iext, imsg, ZExtZBufHeader},
-    core::{Priority, Resolution, WhatAmI, ZenohId},
+    core::{Priority, Resolution, WhatAmI, ZenohIdProto},
     transport::{
         batch_size, id,
         join::{ext, flag, Join},
         BatchSize, PrioritySn, TransportSn,
     },
 };
+
+use crate::{common::extension, LCodec, RCodec, WCodec, Zenoh080, Zenoh080Header, Zenoh080Length};
 
 impl LCodec<&PrioritySn> for Zenoh080 {
     fn w_len(self, p: &PrioritySn) -> usize {
@@ -121,7 +123,7 @@ where
         let (_, more): (ZExtZBufHeader<{ ext::QoS::ID }>, bool) = self.read(&mut *reader)?;
 
         // Body
-        let mut ext_qos = Box::new([PrioritySn::default(); Priority::NUM]);
+        let mut ext_qos = Box::new([PrioritySn::DEFAULT; Priority::NUM]);
         for p in ext_qos.iter_mut() {
             *p = self.codec.read(&mut *reader)?;
         }
@@ -148,6 +150,7 @@ where
             next_sn,
             ext_qos,
             ext_shm,
+            ext_patch,
         } = x;
 
         // Header
@@ -158,7 +161,9 @@ where
         if resolution != &Resolution::default() || batch_size != &batch_size::MULTICAST {
             header |= flag::S;
         }
-        let mut n_exts = (ext_qos.is_some() as u8) + (ext_shm.is_some() as u8);
+        let mut n_exts = (ext_qos.is_some() as u8)
+            + (ext_shm.is_some() as u8)
+            + (*ext_patch != ext::PatchType::NONE) as u8;
         if n_exts != 0 {
             header |= flag::Z;
         }
@@ -198,6 +203,10 @@ where
         if let Some(shm) = ext_shm.as_ref() {
             n_exts -= 1;
             self.write(&mut *writer, (shm, n_exts != 0))?;
+        }
+        if *ext_patch != ext::PatchType::NONE {
+            n_exts -= 1;
+            self.write(&mut *writer, (*ext_patch, n_exts != 0))?;
         }
 
         Ok(())
@@ -240,7 +249,7 @@ where
         };
         let length = 1 + ((flags >> 4) as usize);
         let lodec = Zenoh080Length::new(length);
-        let zid: ZenohId = lodec.read(&mut *reader)?;
+        let zid: ZenohIdProto = lodec.read(&mut *reader)?;
 
         let mut resolution = Resolution::default();
         let mut batch_size = batch_size::MULTICAST.to_le_bytes();
@@ -262,6 +271,7 @@ where
         // Extensions
         let mut ext_qos = None;
         let mut ext_shm = None;
+        let mut ext_patch = ext::PatchType::NONE;
 
         let mut has_ext = imsg::has_flag(self.header, flag::Z);
         while has_ext {
@@ -276,6 +286,11 @@ where
                 ext::Shm::ID => {
                     let (s, ext): (ext::Shm, bool) = eodec.read(&mut *reader)?;
                     ext_shm = Some(s);
+                    has_ext = ext;
+                }
+                ext::Patch::ID => {
+                    let (p, ext): (ext::PatchType, bool) = eodec.read(&mut *reader)?;
+                    ext_patch = p;
                     has_ext = ext;
                 }
                 _ => {
@@ -294,6 +309,7 @@ where
             next_sn,
             ext_qos,
             ext_shm,
+            ext_patch,
         })
     }
 }

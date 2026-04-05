@@ -13,6 +13,7 @@
 //
 
 use alloc::vec::Vec;
+
 use zenoh_result::unlikely;
 
 use crate::keyexpr_tree::*;
@@ -60,13 +61,19 @@ impl<T: HasChunk + AsNode<T> + AsNodeMut<T> + 'static> IChildren<T> for Vec<T> {
     fn is_empty(&self) -> bool {
         self.is_empty()
     }
-    type Entry<'a, 'b> = Entry<'a, 'b, T> where Self: 'a , 'a: 'b, T: 'b;
+    type Entry<'a, 'b>
+        = Entry<'a, 'b, T>
+    where
+        Self: 'a,
+        'a: 'b,
+        T: 'b;
     fn entry<'a, 'b>(&'a mut self, chunk: &'b keyexpr) -> Self::Entry<'a, 'b>
     where
         Self: 'a,
         'a: 'b,
         T: 'b,
     {
+        // SAFETY: upheld by the surrounding invariants and prior validation.
         let this = unsafe { &mut *(self as *mut Self) };
         match self.child_at_mut(chunk) {
             Some(entry) => Entry::Occupied(entry),
@@ -74,7 +81,10 @@ impl<T: HasChunk + AsNode<T> + AsNodeMut<T> + 'static> IChildren<T> for Vec<T> {
         }
     }
 
-    type Iter<'a> = core::slice::Iter<'a, T> where Self: 'a;
+    type Iter<'a>
+        = core::slice::Iter<'a, T>
+    where
+        Self: 'a;
     fn children<'a>(&'a self) -> Self::Iter<'a>
     where
         Self: 'a,
@@ -82,9 +92,10 @@ impl<T: HasChunk + AsNode<T> + AsNodeMut<T> + 'static> IChildren<T> for Vec<T> {
         self.iter()
     }
 
-    type IterMut<'a> = core::slice::IterMut<'a, T>
-where
-    Self: 'a;
+    type IterMut<'a>
+        = core::slice::IterMut<'a, T>
+    where
+        Self: 'a;
 
     fn children_mut<'a>(&'a mut self) -> Self::IterMut<'a>
     where
@@ -101,28 +112,32 @@ where
         }
     }
 
-    type Intersection<'a> = super::FilterMap<core::slice::Iter<'a, T>, super::Intersection<'a>>
+    type Intersection<'a>
+        = super::FilterMap<core::slice::Iter<'a, T>, super::Intersection<'a>>
     where
         Self: 'a,
         Self::Node: 'a;
     fn intersection<'a>(&'a self, key: &'a keyexpr) -> Self::Intersection<'a> {
         super::FilterMap::new(self.iter(), super::Intersection(key))
     }
-    type IntersectionMut<'a> = super::FilterMap<core::slice::IterMut<'a, T>, super::Intersection<'a>>
+    type IntersectionMut<'a>
+        = super::FilterMap<core::slice::IterMut<'a, T>, super::Intersection<'a>>
     where
         Self: 'a,
         Self::Node: 'a;
     fn intersection_mut<'a>(&'a mut self, key: &'a keyexpr) -> Self::IntersectionMut<'a> {
         super::FilterMap::new(self.iter_mut(), super::Intersection(key))
     }
-    type Inclusion<'a> = super::FilterMap<core::slice::Iter<'a, T>, super::Inclusion<'a>>
+    type Inclusion<'a>
+        = super::FilterMap<core::slice::Iter<'a, T>, super::Inclusion<'a>>
     where
         Self: 'a,
         Self::Node: 'a;
     fn inclusion<'a>(&'a self, key: &'a keyexpr) -> Self::Inclusion<'a> {
         super::FilterMap::new(self.iter(), super::Inclusion(key))
     }
-    type InclusionMut<'a> = super::FilterMap<core::slice::IterMut<'a, T>, super::Inclusion<'a>>
+    type InclusionMut<'a>
+        = super::FilterMap<core::slice::IterMut<'a, T>, super::Inclusion<'a>>
     where
         Self: 'a,
         Self::Node: 'a;

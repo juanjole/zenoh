@@ -13,18 +13,10 @@
 //
 
 use super::keyexpr;
+use crate::DELIMITER;
 
 mod classical;
 pub use classical::ClassicIntersector;
-// #[deprecated = "This module hasn't been updated to support the $* DSL yet"]
-// pub(crate) mod ltr;
-// #[deprecated = "This module hasn't been updated to support the $* DSL yet"]
-// pub(crate) mod ltr_chunk;
-// #[deprecated = "This module hasn't been updated to support the $* DSL yet"]
-// pub(crate) mod middle_out;
-// pub use ltr::LeftToRightIntersector;
-// pub use ltr_chunk::LTRChunkIntersector;
-// pub use middle_out::MiddleOutIntersector;
 
 pub const DEFAULT_INTERSECTOR: ClassicIntersector = ClassicIntersector;
 
@@ -36,23 +28,10 @@ pub trait Intersector<Left, Right> {
     fn intersect(&self, left: Left, right: Right) -> bool;
 }
 
-pub(crate) mod restiction {
-    use core::ops::Deref;
-
-    #[repr(transparent)]
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub struct NoBigWilds<T>(pub T);
+pub(crate) mod restriction {
     #[repr(transparent)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct NoSubWilds<T>(pub T);
-
-    impl<T> Deref for NoBigWilds<T> {
-        type Target = T;
-
-        fn deref(&self) -> &Self::Target {
-            &self.0
-        }
-    }
 }
 #[repr(u8)]
 enum MatchComplexity {
@@ -81,7 +60,7 @@ impl KeyExprHelpers for keyexpr {
     }
 }
 
-use restiction::NoSubWilds;
+use restriction::NoSubWilds;
 impl<
         T: for<'a> Intersector<&'a [u8], &'a [u8]>
             + for<'a> Intersector<NoSubWilds<&'a [u8]>, NoSubWilds<&'a [u8]>>,
@@ -98,5 +77,26 @@ impl<
             1 => self.intersect(NoSubWilds(left_bytes), NoSubWilds(right_bytes)),
             _ => self.intersect(left_bytes, right_bytes),
         }
+    }
+}
+
+pub(crate) trait MayHaveVerbatim {
+    fn has_verbatim(&self) -> bool;
+    fn has_direct_verbatim(&self) -> bool;
+    fn has_direct_verbatim_non_empty(&self) -> bool {
+        self.has_direct_verbatim()
+    }
+}
+
+impl MayHaveVerbatim for [u8] {
+    fn has_direct_verbatim(&self) -> bool {
+        matches!(self, [b'@', ..])
+    }
+    fn has_verbatim(&self) -> bool {
+        self.split(|c| *c == DELIMITER)
+            .any(MayHaveVerbatim::has_direct_verbatim)
+    }
+    fn has_direct_verbatim_non_empty(&self) -> bool {
+        self.first() == Some(&b'@')
     }
 }

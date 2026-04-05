@@ -35,7 +35,7 @@ pub(crate) fn get_mask(resolution: Bits) -> TransportSn {
 ///
 /// The [`SeqNum`][SeqNum] encapsulates the sequence numbers along with a
 /// the comparison operators that check whether two sequence numbers are
-/// less, equeal or greater of each other.
+/// less, equal or greater of each other.
 ///
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SeqNum {
@@ -50,14 +50,16 @@ impl SeqNum {
     /// * `value` - The sequence number.
     ///
     /// * `resolution` - The resolution (modulo) to be used for the sequence number.
-    ///                  As a consequence of wire zenoh's representation of sequence numbers it is
-    ///                  recommended that the resolution is a power of 2 with exponent multiple of 7.
-    ///                  Suggested values are:
-    ///                  - 256 (i.e., 2^7)
-    ///                  - 16_386 (i.e., 2^14)
-    ///                  - 2_097_152 (i.e., 2^21)
+    ///   As a consequence of wire zenoh's representation of sequence numbers it is
+    ///   recommended that the resolution is a power of 2 with exponent multiple of 7.
+    ///   Suggested values are:
+    ///   - 256 (i.e., 2^7)
+    ///   - 16_386 (i.e., 2^14)
+    ///   - 2_097_152 (i.e., 2^21)
     ///
-    /// This funtion will panic if `value` is out of bound w.r.t. `resolution`. That is if
+    /// # Errors
+    ///
+    /// This function will return an error if `value` is out of bound w.r.t. `resolution`. That is if
     /// `value` is greater or equal than `resolution`.
     ///
     pub(crate) fn make(value: TransportSn, resolution: Bits) -> ZResult<SeqNum> {
@@ -173,14 +175,16 @@ impl SeqNumGenerator {
     ///
     /// # Arguments
     /// * `initial_sn` - The initial sequence number. It is a good practice to initialize the
-    ///           sequence number generator with a random number
+    ///   sequence number generator with a random number
     ///
     /// * `sn_resolution` - The resolution, in bits, to be used for the sequence number generator.
-    ///                  As a consequence of wire zenoh's representation of sequence numbers
-    ///                  this should be a multiple of 7.
+    ///   As a consequence of wire zenoh's representation of sequence numbers
+    ///   this should be a multiple of 7.
     ///
-    /// This funtion will panic if `value` is out of bound w.r.t. `resolution`. That is if
-    /// `value` is greater or equal than `resolution`.
+    /// # Errors
+    ///
+    /// This function will return an error if `initial_sn` is out of bound w.r.t. `resolution`. That is if
+    ///   `initial_sn` is greater or equal than `resolution`.
     ///
     pub(crate) fn make(initial_sn: TransportSn, resolution: Bits) -> ZResult<SeqNumGenerator> {
         let sn = SeqNum::make(initial_sn, resolution)?;

@@ -11,7 +11,7 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use super::{keyexpr, utils::Split, DELIMITER, DOUBLE_WILD, STAR_DSL};
+use super::{intersect::MayHaveVerbatim, keyexpr, utils::Split, DELIMITER, DOUBLE_WILD, STAR_DSL};
 
 pub const DEFAULT_INCLUDER: LTRIncluder = LTRIncluder;
 
@@ -24,7 +24,7 @@ impl<T: for<'a> Includer<&'a [u8], &'a [u8]>> Includer<&keyexpr, &keyexpr> for T
     fn includes(&self, left: &keyexpr, right: &keyexpr) -> bool {
         let left = left.as_bytes();
         let right = right.as_bytes();
-        if left == right || left == b"**" {
+        if left == right {
             return true;
         }
         self.includes(left, right)
@@ -35,18 +35,21 @@ pub struct LTRIncluder;
 impl Includer<&[u8], &[u8]> for LTRIncluder {
     fn includes(&self, mut left: &[u8], mut right: &[u8]) -> bool {
         loop {
-            let (lchunk, lrest) = left.split_once(&DELIMITER);
+            let (lchunk, lrest) = Split::split_once(left, &DELIMITER);
             let lempty = lrest.is_empty();
             if lchunk == DOUBLE_WILD {
-                if lempty || self.includes(lrest, right) {
+                if (lempty && !right.has_verbatim()) || (!lempty && self.includes(lrest, right)) {
                     return true;
                 }
-                right = right.split_once(&DELIMITER).1;
+                if right.has_direct_verbatim() {
+                    return false;
+                }
+                right = Split::split_once(right, &DELIMITER).1;
                 if right.is_empty() {
                     return false;
                 }
             } else {
-                let (rchunk, rrest) = right.split_once(&DELIMITER);
+                let (rchunk, rrest) = Split::split_once(right, &DELIMITER);
                 if rchunk.is_empty()
                     || rchunk == DOUBLE_WILD
                     || !self.non_double_wild_chunk_includes(lchunk, rchunk)
@@ -66,7 +69,11 @@ impl Includer<&[u8], &[u8]> for LTRIncluder {
 
 impl LTRIncluder {
     fn non_double_wild_chunk_includes(&self, lchunk: &[u8], rchunk: &[u8]) -> bool {
-        if lchunk == b"*" || lchunk == rchunk {
+        if lchunk == rchunk {
+            true
+        } else if lchunk.has_direct_verbatim_non_empty() || rchunk.has_direct_verbatim_non_empty() {
+            false
+        } else if lchunk == b"*" {
             true
         } else if lchunk.contains(&b'$') {
             let mut spleft = lchunk.splitter(STAR_DSL);

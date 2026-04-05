@@ -16,13 +16,13 @@
 //!
 //! This crate is intended for Zenoh's internal use.
 //!
-//! [Click here for Zenoh's documentation](../zenoh/index.html)
+//! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
-use alloc::boxed::Box;
-use anyhow::Error as AnyError;
 use core::fmt;
+
+use anyhow::Error as AnyError;
 
 #[cold]
 pub const fn cold() {}
@@ -39,6 +39,8 @@ pub const fn unlikely(b: bool) -> bool {
     b
 }
 
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use core::any::Any;
 

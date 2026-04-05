@@ -16,7 +16,7 @@
 //!
 //! This crate is intended for Zenoh's internal use.
 //!
-//! [Click here for Zenoh's documentation](../zenoh/index.html)
+//! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
@@ -28,7 +28,7 @@ pub mod transport;
 pub mod zenoh;
 
 // Zenoh version
-pub const VERSION: u8 = 0x08;
+pub const VERSION: u8 = 0x09;
 
 // Zenoh protocol uses the following conventions for message definition and representation.
 //
@@ -73,7 +73,7 @@ pub const VERSION: u8 = 0x08;
 // # Array field
 //
 // An array contains a fixed number of elements whose number is known a priori or indicated by
-// another field. Each element can be either a single byte field or a variable legnth field.
+// another field. Each element can be either a single byte field or a variable length field.
 //
 // ```text
 //  7 6 5 4 3 2 1 0

@@ -11,22 +11,33 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use schemars::JsonSchema;
-use serde::de::{Unexpected, Visitor};
-use serde::{de, Deserialize, Deserializer};
 use std::fmt;
 
+use schemars::JsonSchema;
+use serde::{
+    de,
+    de::{Unexpected, Visitor},
+    Deserialize, Deserializer,
+};
+
 const DEFAULT_HTTP_INTERFACE: &str = "[::]";
+pub const DEFAULT_WORK_THREAD_NUM: usize = 2;
+pub const DEFAULT_MAX_BLOCK_THREAD_NUM: usize = 50;
 
 #[derive(JsonSchema, Deserialize, serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(deserialize_with = "deserialize_http_port")]
     pub http_port: String,
+    #[serde(default = "default_work_thread_num")]
+    pub work_thread_num: usize,
+    #[serde(default = "default_max_block_thread_num")]
+    pub max_block_thread_num: usize,
     #[serde(default, deserialize_with = "deserialize_path")]
     __path__: Option<Vec<String>>,
     __required__: Option<bool>,
     __config__: Option<String>,
+    __plugin__: Option<String>,
 }
 
 impl From<&Config> for serde_json::Value {
@@ -42,9 +53,17 @@ where
     deserializer.deserialize_any(HttpPortVisitor)
 }
 
+fn default_work_thread_num() -> usize {
+    DEFAULT_WORK_THREAD_NUM
+}
+
+fn default_max_block_thread_num() -> usize {
+    DEFAULT_MAX_BLOCK_THREAD_NUM
+}
+
 struct HttpPortVisitor;
 
-impl<'de> Visitor<'de> for HttpPortVisitor {
+impl Visitor<'_> for HttpPortVisitor {
     type Value = String;
 
     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {

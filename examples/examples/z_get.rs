@@ -11,41 +11,60 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use clap::Parser;
-use std::convert::TryFrom;
 use std::time::Duration;
-use zenoh::config::Config;
-use zenoh::prelude::r#async::*;
+
+use clap::Parser;
+use zenoh::{
+    query::{QueryTarget, Selector},
+    Config,
+};
 use zenoh_examples::CommonArgs;
 
-#[async_std::main]
+#[tokio::main]
 async fn main() {
     // initiate logging
-    env_logger::init();
+    zenoh::init_log_from_env_or("error");
 
-    let (config, selector, value, target, timeout) = parse_args();
+    let (config, selector, payload, target, timeout) = parse_args();
 
     println!("Opening session...");
-    let session = zenoh::open(config).res().await.unwrap();
+    let session = zenoh::open(config).await.unwrap();
 
     println!("Sending Query '{selector}'...");
-    let replies = match value {
-        Some(value) => session.get(&selector).with_value(value),
-        None => session.get(&selector),
+    let mut builder = session
+        .get(&selector)
+        // // By default get receives replies from a FIFO.
+        // // Uncomment this line to use a ring channel instead.
+        // // More information on the ring channel are available in the z_pull example.
+        // .with(zenoh::handlers::RingChannel::default())
+        // Refer to z_bytes.rs to see how to serialize different types of message
+        .target(target)
+        .timeout(timeout);
+    if let Some(payload) = payload {
+        builder = builder.payload(payload);
     }
-    .target(target)
-    .timeout(timeout)
-    .res()
-    .await
-    .unwrap();
+    let replies = builder.await.unwrap();
     while let Ok(reply) = replies.recv_async().await {
-        match reply.sample {
-            Ok(sample) => println!(
-                ">> Received ('{}': '{}')",
-                sample.key_expr.as_str(),
-                sample.value,
-            ),
-            Err(err) => println!(">> Received (ERROR: '{}')", String::try_from(&err).unwrap()),
+        match reply.result() {
+            Ok(sample) => {
+                // Refer to z_bytes.rs to see how to deserialize different types of message
+                let payload = sample
+                    .payload()
+                    .try_to_string()
+                    .unwrap_or_else(|e| e.to_string().into());
+                println!(
+                    ">> Received ('{}': '{}')",
+                    sample.key_expr().as_str(),
+                    payload,
+                );
+            }
+            Err(err) => {
+                let payload = err
+                    .payload()
+                    .try_to_string()
+                    .unwrap_or_else(|e| e.to_string().into());
+                println!(">> Received (ERROR: '{payload}')");
+            }
         }
     }
 }
@@ -64,8 +83,8 @@ struct Args {
     /// The selection of resources to query
     selector: Selector<'static>,
     #[arg(short, long)]
-    /// An optional value to put in the query.
-    value: Option<String>,
+    /// An optional payload to put in the query.
+    payload: Option<String>,
     #[arg(short, long, default_value = "BEST_MATCHING")]
     /// The target queryables of the query.
     target: Qt,
@@ -87,7 +106,7 @@ fn parse_args() -> (
     (
         args.common.into(),
         args.selector,
-        args.value,
+        args.payload,
         match args.target {
             Qt::BestMatching => QueryTarget::BestMatching,
             Qt::All => QueryTarget::All,

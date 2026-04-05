@@ -31,7 +31,7 @@ pub use keepalive::KeepAlive;
 pub use oam::Oam;
 pub use open::{OpenAck, OpenSyn};
 
-use crate::network::NetworkMessage;
+use crate::network::{NetworkMessage, NetworkMessageRef};
 
 /// NOTE: 16 bits (2 bytes) may be prepended to the serialized message indicating the total length
 ///       in bytes of the message, resulting in the maximum length of a message being 65_535 bytes.
@@ -39,6 +39,7 @@ use crate::network::NetworkMessage;
 ///       the boundary of the serialized messages. The length is encoded as little-endian.
 ///       In any case, the length of a message must not exceed 65_535 bytes.
 pub type BatchSize = u16;
+pub type AtomicBatchSize = core::sync::atomic::AtomicU16;
 
 pub mod batch_size {
     use super::BatchSize;
@@ -65,6 +66,20 @@ pub struct TransportMessageLowLatency {
     pub body: TransportBodyLowLatency,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct TransportMessageLowLatencyRef<'a> {
+    pub body: TransportBodyLowLatencyRef<'a>,
+}
+
+impl TryFrom<NetworkMessage> for TransportMessageLowLatency {
+    type Error = zenoh_result::Error;
+    fn try_from(msg: NetworkMessage) -> Result<Self, Self::Error> {
+        Ok(Self {
+            body: TransportBodyLowLatency::Network(msg),
+        })
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum TransportBodyLowLatency {
@@ -73,16 +88,30 @@ pub enum TransportBodyLowLatency {
     Network(NetworkMessage),
 }
 
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, Copy)]
+pub enum TransportBodyLowLatencyRef<'a> {
+    Close(Close),
+    KeepAlive(KeepAlive),
+    Network(NetworkMessageRef<'a>),
+}
+
 pub type TransportSn = u32;
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct PrioritySn {
     pub reliable: TransportSn,
     pub best_effort: TransportSn,
 }
 
 impl PrioritySn {
+    pub const DEFAULT: Self = Self {
+        reliable: TransportSn::MIN,
+        best_effort: TransportSn::MIN,
+    };
+
     #[cfg(feature = "test")]
+    #[doc(hidden)]
     pub fn rand() -> Self {
         use rand::Rng;
         let mut rng = rand::thread_rng();
@@ -112,12 +141,11 @@ pub enum TransportBody {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportMessage {
     pub body: TransportBody,
-    #[cfg(feature = "stats")]
-    pub size: Option<core::num::NonZeroUsize>,
 }
 
 impl TransportMessage {
     #[cfg(feature = "test")]
+    #[doc(hidden)]
     pub fn rand() -> Self {
         use rand::Rng;
 
@@ -137,21 +165,13 @@ impl TransportMessage {
             _ => unreachable!(),
         };
 
-        Self {
-            body,
-            #[cfg(feature = "stats")]
-            size: None,
-        }
+        Self { body }
     }
 }
 
 impl From<TransportBody> for TransportMessage {
     fn from(body: TransportBody) -> Self {
-        Self {
-            body,
-            #[cfg(feature = "stats")]
-            size: None,
-        }
+        Self { body }
     }
 }
 
@@ -240,11 +260,13 @@ impl fmt::Display for TransportMessage {
 pub mod ext {
     use crate::{common::ZExtZ64, core::Priority};
 
+    /// ```text
     ///  7 6 5 4 3 2 1 0
     /// +-+-+-+-+-+-+-+-+
     /// %0|  rsv  |prio %
     /// +---------------+
     /// - prio: Priority class
+    /// ```
     #[repr(transparent)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct QoSType<const ID: u8> {
@@ -252,7 +274,8 @@ pub mod ext {
     }
 
     impl<const ID: u8> QoSType<{ ID }> {
-        pub const P_MASK: u8 = 0b00000111;
+        const P_MASK: u8 = 0b00000111;
+        pub const DEFAULT: Self = Self::new(Priority::DEFAULT);
 
         pub const fn new(priority: Priority) -> Self {
             Self {
@@ -265,6 +288,7 @@ pub mod ext {
         }
 
         #[cfg(feature = "test")]
+        #[doc(hidden)]
         pub fn rand() -> Self {
             use rand::Rng;
             let mut rng = rand::thread_rng();
@@ -276,7 +300,7 @@ pub mod ext {
 
     impl<const ID: u8> Default for QoSType<{ ID }> {
         fn default() -> Self {
-            Self::new(Priority::default())
+            Self::DEFAULT
         }
     }
 
@@ -291,6 +315,45 @@ pub mod ext {
     impl<const ID: u8> From<QoSType<{ ID }>> for ZExtZ64<{ ID }> {
         fn from(ext: QoSType<{ ID }>) -> Self {
             ZExtZ64::new(ext.inner as u64)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct PatchType<const ID: u8>(u8);
+
+    impl<const ID: u8> PatchType<ID> {
+        pub const NONE: Self = Self(0);
+        pub const CURRENT: Self = Self(1);
+
+        pub fn new(int: u8) -> Self {
+            Self(int)
+        }
+
+        pub fn raw(self) -> u8 {
+            self.0
+        }
+
+        pub fn has_fragmentation_markers(&self) -> bool {
+            self.0 >= 1
+        }
+
+        #[cfg(feature = "test")]
+        #[doc(hidden)]
+        pub fn rand() -> Self {
+            use rand::Rng;
+            Self(rand::thread_rng().gen())
+        }
+    }
+
+    impl<const ID: u8> From<ZExtZ64<ID>> for PatchType<ID> {
+        fn from(ext: ZExtZ64<ID>) -> Self {
+            Self(ext.value as u8)
+        }
+    }
+
+    impl<const ID: u8> From<PatchType<ID>> for ZExtZ64<ID> {
+        fn from(ext: PatchType<ID>) -> Self {
+            ZExtZ64::new(ext.0 as u64)
         }
     }
 }

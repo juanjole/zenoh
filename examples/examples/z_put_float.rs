@@ -12,24 +12,25 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use clap::Parser;
-use zenoh::config::Config;
-use zenoh::prelude::r#async::*;
+use zenoh::{key_expr::KeyExpr, Config};
 use zenoh_examples::CommonArgs;
+use zenoh_ext::z_serialize;
 
-#[async_std::main]
+#[tokio::main]
 async fn main() {
     // initiate logging
-    env_logger::init();
+    zenoh::init_log_from_env_or("error");
 
-    let (config, key_expr, value) = parse_args();
+    let (config, key_expr, payload) = parse_args();
 
     println!("Opening session...");
-    let session = zenoh::open(config).res().await.unwrap();
+    let session = zenoh::open(config).await.unwrap();
 
-    println!("Putting Float ('{key_expr}': '{value}')...");
-    session.put(&key_expr, value).res().await.unwrap();
+    println!("Putting Float ('{key_expr}': '{payload}')...");
+    // you must have imported `zenoh_ext::ZBytesExt` to use `ZBytes::serialize`
+    session.put(&key_expr, z_serialize(&payload)).await.unwrap();
 
-    session.close().res().await.unwrap();
+    session.close().await.unwrap();
 }
 
 #[derive(clap::Parser, Clone, PartialEq, Debug)]
@@ -38,13 +39,13 @@ struct Args {
     /// The key expression to write to.
     key: KeyExpr<'static>,
     #[arg(short, long, default_value_t = std::f64::consts::PI)]
-    /// The value to write.
-    value: f64,
+    /// The payload to write.
+    payload: f64,
     #[command(flatten)]
     common: CommonArgs,
 }
 
 fn parse_args() -> (Config, KeyExpr<'static>, f64) {
     let args = Args::parse();
-    (args.common.into(), args.key, args.value)
+    (args.common.into(), args.key, args.payload)
 }

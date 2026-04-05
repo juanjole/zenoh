@@ -50,11 +50,12 @@ impl<'a> TryFrom<&'a str> for Spec<'a> {
         }
     }
 }
-impl<'a> Spec<'a> {
+impl Spec<'_> {
     pub fn id(&self) -> &str {
         &self.spec[..self.id_end as usize]
     }
     pub fn pattern(&self) -> &keyexpr {
+        // SAFETY: upheld by the surrounding invariants and prior validation.
         unsafe {
             keyexpr::from_str_unchecked(if self.pattern_end != u16::MAX {
                 &self.spec[(self.id_end + 1) as usize..self.pattern_end as usize]
@@ -66,6 +67,7 @@ impl<'a> Spec<'a> {
     pub fn default(&self) -> Option<&keyexpr> {
         let pattern_end = self.pattern_end as usize;
         (self.spec.len() > pattern_end)
+            // SAFETY: upheld by the surrounding invariants and prior validation.
             .then(|| unsafe { keyexpr::from_str_unchecked(&self.spec[(pattern_end + 1)..]) })
     }
 }
@@ -86,8 +88,33 @@ impl core::fmt::Display for Spec<'_> {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Segment<'a> {
+    /// What precedes a spec in a [`KeFormat`].
+    /// It may be:
+    /// - empty if the spec is the first thing in the format.
+    /// - `/` if the spec comes right after another spec.
+    /// - a valid keyexpr followed by `/` if the spec comes after a keyexpr.
     pub(crate) prefix: &'a str,
     pub(crate) spec: Spec<'a>,
+}
+impl Segment<'_> {
+    pub fn prefix(&self) -> Option<&keyexpr> {
+        match self.prefix {
+            "" | "/" => None,
+            // SAFETY: upheld by the surrounding invariants and prior validation.
+            _ => Some(unsafe {
+                keyexpr::from_str_unchecked(trim_suffix_slash(trim_prefix_slash(self.prefix)))
+            }),
+        }
+    }
+    pub fn id(&self) -> &str {
+        self.spec.id()
+    }
+    pub fn pattern(&self) -> &keyexpr {
+        self.spec.pattern()
+    }
+    pub fn default(&self) -> Option<&keyexpr> {
+        self.spec.default()
+    }
 }
 
 pub enum IterativeConstructor<Complete, Partial, Error> {
@@ -146,6 +173,7 @@ impl<'s, const N: usize> IKeFormatStorage<'s> for [Segment<'s>; N] {
                 this[n] = core::mem::MaybeUninit::new(segment);
                 n += 1;
                 if n == N {
+                    // SAFETY: upheld by the surrounding invariants and prior validation.
                     IterativeConstructor::Complete(this.map(|e| unsafe { e.assume_init() }))
                 } else {
                     IterativeConstructor::Partial((this, n as u16))
@@ -194,9 +222,11 @@ impl<T, const N: usize> PartialSlice<T, N> {
 impl<T, const N: usize> TryFrom<PartialSlice<T, N>> for [T; N] {
     type Error = PartialSlice<T, N>;
     fn try_from(value: PartialSlice<T, N>) -> Result<Self, Self::Error> {
+        // SAFETY: upheld by the surrounding invariants and prior validation.
         let buffer = unsafe { core::ptr::read(&value.buffer) };
         if value.n as usize == N {
             core::mem::forget(value);
+            // SAFETY: upheld by the surrounding invariants and prior validation.
             Ok(buffer.map(|v| unsafe { v.assume_init() }))
         } else {
             Err(value)
@@ -206,6 +236,7 @@ impl<T, const N: usize> TryFrom<PartialSlice<T, N>> for [T; N] {
 impl<T, const N: usize> Drop for PartialSlice<T, N> {
     fn drop(&mut self) {
         for i in 0..self.n as usize {
+            // SAFETY: upheld by the surrounding invariants and prior validation.
             unsafe { core::mem::MaybeUninit::assume_init_drop(&mut self.buffer[i]) }
         }
     }
@@ -222,7 +253,12 @@ impl<'s> IKeFormatStorage<'s> for Vec<Segment<'s>> {
         constructor: IterativeConstructor<Self, Self::PartialConstruct, Self::ConstructionError>,
         segment: Segment<'s>,
     ) -> IterativeConstructor<Self, Self::PartialConstruct, Self::ConstructionError> {
-        let IterativeConstructor::Complete(mut this) = constructor else {
+        // NOTE(fuzzypixelz): Rust 1.82.0 can detect that this pattern is irrefutable but that's not
+        // necessarily the case for prior versions. Thus we silence this lint to keep the MSRV minimal.
+        #[allow(irrefutable_let_patterns)]
+        let IterativeConstructor::Complete(mut this) = constructor
+        else {
+            // SAFETY: upheld by the surrounding invariants and prior validation.
             unsafe { core::hint::unreachable_unchecked() }
         };
         this.push(segment);
@@ -246,6 +282,9 @@ impl<'s> IKeFormatStorage<'s> for Vec<Segment<'s>> {
     }
 }
 
+/// Trim the prefix slash from a target string if it has one.
+/// # Safety
+/// `target` is assumed to be a valid `keyexpr` except for the leading slash.
 pub(crate) fn trim_prefix_slash(target: &str) -> &str {
     &target[matches!(target.as_bytes().first(), Some(b'/')) as usize..]
 }

@@ -10,26 +10,25 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use async_std::prelude::FutureExt;
-use async_std::sync::Barrier;
-use async_std::task;
-use std::any::Any;
-use std::convert::TryFrom;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-use zenoh_core::zasync_executor_init;
+use std::{
+    any::Any,
+    convert::TryFrom,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
+use tokio::sync::Barrier;
+use zenoh_core::ztimeout;
 use zenoh_link::Link;
 use zenoh_protocol::{
-    core::{CongestionControl, Encoding, EndPoint, Priority, WhatAmI, ZenohId},
+    core::{CongestionControl, EndPoint, Priority, WhatAmI, ZenohIdProto},
     network::{
-        push::{
-            ext::{NodeIdType, QoSType},
-            Push,
-        },
-        NetworkMessage,
+        push::{ext::QoSType, Push},
+        NetworkMessage, NetworkMessageMut,
     },
-    zenoh::Put,
 };
 use zenoh_result::ZResult;
 use zenoh_transport::{
@@ -41,12 +40,6 @@ const MSG_COUNT: usize = 1_000;
 const MSG_SIZE: usize = 1_024;
 const TIMEOUT: Duration = Duration::from_secs(60);
 const SLEEP: Duration = Duration::from_millis(100);
-
-macro_rules! ztimeout {
-    ($f:expr) => {
-        $f.timeout(TIMEOUT).await.unwrap()
-    };
-}
 
 // Transport Handler for the router
 struct SHPeer {
@@ -94,14 +87,13 @@ impl MHPeer {
 }
 
 impl TransportPeerEventHandler for MHPeer {
-    fn handle_message(&self, _msg: NetworkMessage) -> ZResult<()> {
+    fn handle_message(&self, _msg: NetworkMessageMut) -> ZResult<()> {
         self.count.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
     fn new_link(&self, _link: Link) {}
     fn del_link(&self, _link: Link) {}
-    fn closing(&self) {}
     fn closed(&self) {}
 
     fn as_any(&self) -> &dyn Any {
@@ -111,8 +103,8 @@ impl TransportPeerEventHandler for MHPeer {
 
 async fn transport_concurrent(endpoint01: Vec<EndPoint>, endpoint02: Vec<EndPoint>) {
     /* [Peers] */
-    let peer_id01 = ZenohId::try_from([2]).unwrap();
-    let peer_id02 = ZenohId::try_from([3]).unwrap();
+    let peer_id01 = ZenohIdProto::try_from([2]).unwrap();
+    let peer_id02 = ZenohIdProto::try_from([3]).unwrap();
 
     // Create the peer01 transport manager
     let peer_sh01 = Arc::new(SHPeer::new());
@@ -121,7 +113,7 @@ async fn transport_concurrent(endpoint01: Vec<EndPoint>, endpoint02: Vec<EndPoin
         .whatami(WhatAmI::Peer)
         .zid(peer_id01)
         .unicast(unicast01)
-        .build(peer_sh01.clone())
+        .build_test(peer_sh01.clone())
         .unwrap();
 
     // Create the peer01 transport manager
@@ -131,7 +123,7 @@ async fn transport_concurrent(endpoint01: Vec<EndPoint>, endpoint02: Vec<EndPoin
         .whatami(WhatAmI::Peer)
         .zid(peer_id02)
         .unicast(unicast02)
-        .build(peer_sh02.clone())
+        .build_test(peer_sh02.clone())
         .unwrap();
 
     // Barrier to synchronize the two tasks
@@ -146,14 +138,14 @@ async fn transport_concurrent(endpoint01: Vec<EndPoint>, endpoint02: Vec<EndPoin
     let c_zid02 = peer_id02;
     let c_end01 = endpoint01.clone();
     let c_end02 = endpoint02.clone();
-    let peer01_task = task::spawn(async move {
+    let peer01_task = tokio::task::spawn(async move {
         // Add the endpoints on the first peer
         for e in c_end01.iter() {
             let res = ztimeout!(peer01_manager.add_listener(e.clone()));
             println!("[Transport Peer 01a] => Adding endpoint {e:?}: {res:?}");
             assert!(res.is_ok());
         }
-        let locs = peer01_manager.get_listeners();
+        let locs = ztimeout!(peer01_manager.get_listeners());
         println!("[Transport Peer 01b] => Getting endpoints: {c_end01:?} {locs:?}");
         assert_eq!(c_end01.len(), locs.len());
 
@@ -163,7 +155,7 @@ async fn transport_concurrent(endpoint01: Vec<EndPoint>, endpoint02: Vec<EndPoin
             let cc_barod = c_barod.clone();
             let c_p01m = peer01_manager.clone();
             let c_end = e.clone();
-            task::spawn(async move {
+            tokio::task::spawn(async move {
                 println!("[Transport Peer 01c] => Waiting for opening transport");
                 // Syncrhonize before opening the transports
                 ztimeout!(cc_barow.wait());
@@ -181,50 +173,34 @@ async fn transport_concurrent(endpoint01: Vec<EndPoint>, endpoint02: Vec<EndPoin
         println!("[Transport Peer 01e] => Waiting... OK");
 
         // Verify that the transport has been correctly open
-        assert_eq!(peer01_manager.get_transports_unicast().await.len(), 1);
-        let s02 = peer01_manager
-            .get_transport_unicast(&c_zid02)
-            .await
-            .unwrap();
+        assert_eq!(ztimeout!(peer01_manager.get_transports_unicast()).len(), 1);
+        let s02 = ztimeout!(peer01_manager.get_transport_unicast(&c_zid02)).unwrap();
         assert_eq!(
             s02.get_links().unwrap().len(),
             c_end01.len() + c_end02.len()
         );
 
         // Create the message to send
-        let message: NetworkMessage = Push {
+        let message = NetworkMessage::from(Push {
             wire_expr: "test".into(),
-            ext_qos: QoSType::new(Priority::default(), CongestionControl::Block, false),
-            ext_tstamp: None,
-            ext_nodeid: NodeIdType::default(),
-            payload: Put {
-                payload: vec![0u8; MSG_SIZE].into(),
-                timestamp: None,
-                encoding: Encoding::default(),
-                ext_sinfo: None,
-                #[cfg(feature = "shared-memory")]
-                ext_shm: None,
-                ext_attachment: None,
-                ext_unknown: vec![],
-            }
-            .into(),
-        }
-        .into();
+            ext_qos: QoSType::new(Priority::DEFAULT, CongestionControl::Block, false),
+            ..Push::from(vec![0u8; MSG_SIZE])
+        });
 
         // Synchronize wit the peer
         ztimeout!(c_barp.wait());
         println!("[Transport Peer 01f] => Waiting... OK");
 
         for i in 0..MSG_COUNT {
-            println!("[Transport Peer 01g] Scheduling message {}", i);
-            s02.schedule(message.clone()).unwrap();
+            println!("[Transport Peer 01g] Scheduling message {i}");
+            s02.schedule(message.clone().as_mut()).unwrap();
         }
         println!("[Transport Peer 01g] => Scheduling OK");
 
         // Wait for the messages to arrive to the other side
         ztimeout!(async {
             while peer_sh02.get_count() != MSG_COUNT {
-                task::sleep(SLEEP).await;
+                tokio::time::sleep(SLEEP).await;
             }
         });
 
@@ -247,14 +223,14 @@ async fn transport_concurrent(endpoint01: Vec<EndPoint>, endpoint02: Vec<EndPoin
     let c_zid01 = peer_id01;
     let c_end01 = endpoint01.clone();
     let c_end02 = endpoint02.clone();
-    let peer02_task = task::spawn(async move {
+    let peer02_task = tokio::task::spawn(async move {
         // Add the endpoints on the first peer
         for e in c_end02.iter() {
             let res = ztimeout!(peer02_manager.add_listener(e.clone()));
             println!("[Transport Peer 02a] => Adding endpoint {e:?}: {res:?}");
             assert!(res.is_ok());
         }
-        let locs = peer02_manager.get_listeners();
+        let locs = ztimeout!(peer02_manager.get_listeners());
         println!("[Transport Peer 02b] => Getting endpoints: {c_end02:?} {locs:?}");
         assert_eq!(c_end02.len(), locs.len());
 
@@ -264,7 +240,7 @@ async fn transport_concurrent(endpoint01: Vec<EndPoint>, endpoint02: Vec<EndPoin
             let cc_barod = c_barod.clone();
             let c_p02m = peer02_manager.clone();
             let c_end = e.clone();
-            task::spawn(async move {
+            tokio::task::spawn(async move {
                 println!("[Transport Peer 02c] => Waiting for opening transport");
                 // Syncrhonize before opening the transports
                 ztimeout!(cc_barow.wait());
@@ -284,52 +260,36 @@ async fn transport_concurrent(endpoint01: Vec<EndPoint>, endpoint02: Vec<EndPoin
         // Verify that the transport has been correctly open
         println!(
             "[Transport Peer 02e] => Transports: {:?}",
-            peer02_manager.get_transports_unicast().await
+            ztimeout!(peer02_manager.get_transports_unicast())
         );
-        assert_eq!(peer02_manager.get_transports_unicast().await.len(), 1);
-        let s01 = peer02_manager
-            .get_transport_unicast(&c_zid01)
-            .await
-            .unwrap();
+        assert_eq!(ztimeout!(peer02_manager.get_transports_unicast()).len(), 1);
+        let s01 = ztimeout!(peer02_manager.get_transport_unicast(&c_zid01)).unwrap();
         assert_eq!(
             s01.get_links().unwrap().len(),
             c_end01.len() + c_end02.len()
         );
 
         // Create the message to send
-        let message: NetworkMessage = Push {
+        let message = NetworkMessage::from(Push {
             wire_expr: "test".into(),
-            ext_qos: QoSType::new(Priority::default(), CongestionControl::Block, false),
-            ext_tstamp: None,
-            ext_nodeid: NodeIdType::default(),
-            payload: Put {
-                payload: vec![0u8; MSG_SIZE].into(),
-                timestamp: None,
-                encoding: Encoding::default(),
-                ext_sinfo: None,
-                #[cfg(feature = "shared-memory")]
-                ext_shm: None,
-                ext_attachment: None,
-                ext_unknown: vec![],
-            }
-            .into(),
-        }
-        .into();
+            ext_qos: QoSType::new(Priority::DEFAULT, CongestionControl::Block, false),
+            ..Push::from(vec![0u8; MSG_SIZE])
+        });
 
         // Synchronize wit the peer
         ztimeout!(c_barp.wait());
         println!("[Transport Peer 02f] => Waiting... OK");
 
         for i in 0..MSG_COUNT {
-            println!("[Transport Peer 02g] Scheduling message {}", i);
-            s01.schedule(message.clone()).unwrap();
+            println!("[Transport Peer 02g] Scheduling message {i}");
+            s01.schedule(message.clone().as_mut()).unwrap();
         }
         println!("[Transport Peer 02g] => Scheduling OK");
 
         // Wait for the messages to arrive to the other side
         ztimeout!(async {
             while peer_sh01.get_count() != MSG_COUNT {
-                task::sleep(SLEEP).await;
+                tokio::time::sleep(SLEEP).await;
             }
         });
 
@@ -346,20 +306,17 @@ async fn transport_concurrent(endpoint01: Vec<EndPoint>, endpoint02: Vec<EndPoin
     });
 
     println!("[Transport Current 01] => Starting...");
-    peer01_task.join(peer02_task).await;
+    let _ = tokio::join!(peer01_task, peer02_task);
     println!("[Transport Current 02] => ...Stopped");
 
     // Wait a little bit
-    task::sleep(SLEEP).await;
+    tokio::time::sleep(SLEEP).await;
 }
 
 #[cfg(feature = "transport_tcp")]
-#[test]
-fn transport_tcp_concurrent() {
-    let _ = env_logger::try_init();
-    task::block_on(async {
-        zasync_executor_init!();
-    });
+#[tokio::test]
+async fn transport_tcp_concurrent() {
+    zenoh_util::init_log_from_env_or("error");
 
     let endpoint01: Vec<EndPoint> = vec![
         format!("tcp/127.0.0.1:{}", 9000).parse().unwrap(),
@@ -382,19 +339,14 @@ fn transport_tcp_concurrent() {
         format!("tcp/127.0.0.1:{}", 9017).parse().unwrap(),
     ];
 
-    task::block_on(async {
-        transport_concurrent(endpoint01, endpoint02).await;
-    });
+    transport_concurrent(endpoint01, endpoint02).await;
 }
 
 #[cfg(feature = "transport_ws")]
-#[test]
+#[tokio::test]
 #[ignore]
-fn transport_ws_concurrent() {
-    let _ = env_logger::try_init();
-    task::block_on(async {
-        zasync_executor_init!();
-    });
+async fn transport_ws_concurrent() {
+    zenoh_util::init_log_from_env_or("error");
 
     let endpoint01: Vec<EndPoint> = vec![
         format!("ws/127.0.0.1:{}", 9020).parse().unwrap(),
@@ -417,19 +369,14 @@ fn transport_ws_concurrent() {
         format!("ws/127.0.0.1:{}", 9037).parse().unwrap(),
     ];
 
-    task::block_on(async {
-        transport_concurrent(endpoint01, endpoint02).await;
-    });
+    transport_concurrent(endpoint01, endpoint02).await;
 }
 
 #[cfg(feature = "transport_unixpipe")]
-#[test]
+#[tokio::test]
 #[ignore]
-fn transport_unixpipe_concurrent() {
-    let _ = env_logger::try_init();
-    task::block_on(async {
-        zasync_executor_init!();
-    });
+async fn transport_unixpipe_concurrent() {
+    zenoh_util::init_log_from_env_or("error");
 
     let endpoint01: Vec<EndPoint> = vec![
         "unixpipe/transport_unixpipe_concurrent".parse().unwrap(),
@@ -452,7 +399,5 @@ fn transport_unixpipe_concurrent() {
         "unixpipe/transport_unixpipe_concurrent16".parse().unwrap(),
     ];
 
-    task::block_on(async {
-        transport_concurrent(endpoint01, endpoint02).await;
-    });
+    transport_concurrent(endpoint01, endpoint02).await;
 }

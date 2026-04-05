@@ -11,51 +11,61 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+pub mod authentication;
 pub mod establishment;
 pub(crate) mod link;
 pub(crate) mod lowlatency;
 pub(crate) mod manager;
+#[cfg(feature = "test")]
+pub mod test_helpers;
 pub(crate) mod transport_unicast_inner;
 pub(crate) mod universal;
 
-#[cfg(feature = "test")]
-pub mod test_helpers;
+use std::{
+    fmt,
+    sync::{Arc, Weak},
+};
 
-#[cfg(feature = "shared-memory")]
-pub(crate) mod shared_memory_unicast;
-
-use self::transport_unicast_inner::TransportUnicastTrait;
-
-use super::{TransportPeer, TransportPeerEventHandler};
 #[cfg(feature = "transport_multilink")]
 use establishment::ext::auth::ZPublicKey;
 pub use manager::*;
-use std::fmt;
-use std::sync::{Arc, Weak};
 use zenoh_core::zcondfeat;
 use zenoh_link::Link;
-use zenoh_protocol::network::NetworkMessage;
 use zenoh_protocol::{
-    core::{Bits, WhatAmI, ZenohId},
-    transport::{close, TransportSn},
+    core::{Bits, Bound, RegionName, WhatAmI, ZenohIdProto},
+    network::NetworkMessageMut,
+    transport::{close, init::ext::PatchType, TransportSn},
 };
 use zenoh_result::{zerror, ZResult};
+
+use self::transport_unicast_inner::TransportUnicastTrait;
+use super::{TransportPeer, TransportPeerEventHandler};
+#[cfg(feature = "shared-memory")]
+use crate::shm::TransportShmConfig;
+use crate::unicast::authentication::TransportAuthId;
+#[cfg(feature = "auth_usrpwd")]
+use crate::unicast::establishment::ext::auth::UsrPwdId;
 
 /*************************************/
 /*        TRANSPORT UNICAST          */
 /*************************************/
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TransportConfigUnicast {
-    pub(crate) zid: ZenohId,
+    pub(crate) zid: ZenohIdProto,
     pub(crate) whatami: WhatAmI,
+    pub(crate) region_name: Option<RegionName>,
+    pub(crate) bound: Option<Bound>,
     pub(crate) sn_resolution: Bits,
     pub(crate) tx_initial_sn: TransportSn,
     pub(crate) is_qos: bool,
     #[cfg(feature = "transport_multilink")]
     pub(crate) multilink: Option<ZPublicKey>,
     #[cfg(feature = "shared-memory")]
-    pub(crate) is_shm: bool,
+    pub(crate) shm: Option<TransportShmConfig>,
     pub(crate) is_lowlatency: bool,
+    #[cfg(feature = "auth_usrpwd")]
+    pub(crate) auth_id: UsrPwdId,
+    pub(crate) patch: PatchType,
 }
 
 /// [`TransportUnicast`] is the transport handler returned
@@ -72,7 +82,7 @@ impl TransportUnicast {
     }
 
     #[inline(always)]
-    pub fn get_zid(&self) -> ZResult<ZenohId> {
+    pub fn get_zid(&self) -> ZResult<ZenohIdProto> {
         let transport = self.get_inner()?;
         Ok(transport.get_zid())
     }
@@ -81,6 +91,12 @@ impl TransportUnicast {
     pub fn get_whatami(&self) -> ZResult<WhatAmI> {
         let transport = self.get_inner()?;
         Ok(transport.get_whatami())
+    }
+
+    #[inline(always)]
+    pub fn get_bound(&self) -> ZResult<Option<Bound>> {
+        let transport = self.get_inner()?;
+        Ok(transport.get_bound())
     }
 
     #[cfg(feature = "shared-memory")]
@@ -105,6 +121,7 @@ impl TransportUnicast {
             is_qos: transport.is_qos(),
             #[cfg(feature = "shared-memory")]
             is_shm: transport.is_shm(),
+            region_name: transport.region_name(),
         };
         Ok(tp)
     }
@@ -115,8 +132,13 @@ impl TransportUnicast {
         Ok(transport.get_links())
     }
 
+    pub fn get_auth_ids(&self) -> ZResult<TransportAuthId> {
+        let transport = self.get_inner()?;
+        Ok(transport.get_auth_ids())
+    }
+
     #[inline(always)]
-    pub fn schedule(&self, message: NetworkMessage) -> ZResult<()> {
+    pub fn schedule(&self, message: NetworkMessageMut) -> ZResult<bool> {
         let transport = self.get_inner()?;
         transport.schedule(message)
     }
@@ -130,8 +152,12 @@ impl TransportUnicast {
         }
     }
 
+    /// Returns the transport stats, or an error if the transport is closed.
+    ///
+    /// Warning: returning an error prevents interceptors to initialize;
+    /// if the error changes in the future, updating interceptors may be necessary.
     #[cfg(feature = "stats")]
-    pub fn get_stats(&self) -> ZResult<Arc<crate::stats::TransportStats>> {
+    pub fn get_stats(&self) -> ZResult<zenoh_stats::TransportStats> {
         Ok(self.get_inner()?.stats())
     }
 }
